@@ -271,6 +271,14 @@ export async function collectSnapshot(
       mintingEnabled: launch.bridgeEnabled,
       guardian: guardian.guardian?.toBase58() ?? null,
       nativeGuardian: state.params.pauseGuardian,
+      reporters: {
+        version: state.policy.version.toString(),
+        members: state.policy.members,
+        quorum: reporterThreshold(
+          state.policy.threshold,
+          state.policy.members.length,
+        ),
+      },
       client: {
         program: client.programId.toBase58(),
         height: height.toString(),

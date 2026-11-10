@@ -16,7 +16,8 @@ import {
   updateTransfers,
 } from "./alerts";
 import { serve } from "./http";
-import { scanRejections } from "./rejections";
+import { scanTransactions } from "./transactions";
+import { queueSummary } from "./summary";
 import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
 
@@ -103,6 +104,7 @@ export async function run(
             identity,
             startedAt: Date.now(),
             rejectionHeight: 0,
+            reporterActivity: null,
             snapshot: null,
             active: {},
             delivered: {},
@@ -135,6 +137,17 @@ export async function run(
         log("slack-delivery-failed", { queued: state.outbox.length });
       }
     };
+    const watchdog = async () => {
+      const now = Date.now();
+      const lastSuccess = state.snapshot
+        ? Date.parse(state.snapshot.checkedAt)
+        : state.startedAt;
+      if (now - lastSuccess >= config.staleSeconds * 1000)
+        observationUnavailable(state, config, now);
+      if (options.notify && !options.once) queueSummary(state, config, now);
+      await persist();
+      await notify();
+    };
     let stopped = false;
     const stop = () => {
       stopped = true;
@@ -155,15 +168,7 @@ export async function run(
         try {
           const { snapshot, akashRpc } = await withObservationWatchdog(
             poll(config, state),
-            async () => {
-              const lastSuccess = state.snapshot
-                ? Date.parse(state.snapshot.checkedAt)
-                : state.startedAt;
-              if (Date.now() - lastSuccess < config.staleSeconds * 1000) return;
-              observationUnavailable(state, config, Date.now());
-              await persist();
-              await notify();
-            },
+            watchdog,
           );
           state.pauseImport =
             snapshot.guardian === config.squadsVault
@@ -172,15 +177,32 @@ export async function run(
           updateTransfers(state, snapshot, now, config);
           state.snapshot = snapshot;
           const alerts = evaluate(snapshot, config);
+          updateAlerts(
+            state,
+            [
+              ...alerts,
+              ...Object.values(state.active).filter(
+                (alert) => alert.key === "rejection-index",
+              ),
+            ],
+            config,
+            Date.now(),
+          );
           try {
-            const rejected = await scanRejections(
-              config,
-              akashRpc,
-              state.rejectionHeight,
-              snapshot.akashHeight,
+            const indexed = await withObservationWatchdog(
+              scanTransactions(
+                config,
+                akashRpc,
+                state.rejectionHeight,
+                snapshot.akashHeight,
+                snapshot.akashTime,
+                state.reporterActivity,
+              ),
+              watchdog,
             );
-            state.rejectionHeight = rejected.height;
-            for (const event of rejected.events) {
+            state.rejectionHeight = indexed.height;
+            state.reporterActivity = indexed.activity;
+            for (const event of indexed.events) {
               if (!state.events.some((entry) => entry.id === event.id))
                 state.events.push(event);
               queueMessage(state, {
@@ -197,23 +219,28 @@ export async function run(
                   akashTxLink(event.txHash, config),
               });
             }
-            if (rejected.height < snapshot.akashHeight)
+            if (indexed.height < snapshot.akashHeight)
               alerts.push({
                 key: "rejection-index",
                 severity: "warning",
-                title: "Rejected-transaction index catching up",
-                detail: `Indexed height ${rejected.height}, latest ${snapshot.akashHeight}.`,
+                title: "Transaction and reporter index catching up",
+                detail: `Indexed height ${indexed.height}, latest ${snapshot.akashHeight}.`,
               });
           } catch {
             alerts.push({
               key: "rejection-index",
               severity: "critical",
-              title: "Rejected-transaction history unavailable",
+              title: "Transaction and reporter history unavailable",
               detail:
-                "Rejection cursor has not advanced; configure an RPC retaining block results. Accounting checks remain independent.",
+                "History cursor has not advanced; reporter activity is incomplete. Configure an RPC retaining block results. Accounting checks remain independent.",
             });
           }
           updateAlerts(state, alerts, config, now);
+          if (
+            Date.now() - Date.parse(snapshot.checkedAt) >=
+            config.staleSeconds * 1000
+          )
+            observationUnavailable(state, config, Date.now());
           success = true;
           log("snapshot", {
             akashHeight: snapshot.akashHeight,
@@ -226,6 +253,8 @@ export async function run(
           const alert = observationUnavailable(state, config, Date.now());
           log("observation-unavailable", { severity: alert.severity });
         }
+        if (options.notify && !options.once)
+          queueSummary(state, config, Date.now());
         await persist();
         await notify();
         if (options.once) {

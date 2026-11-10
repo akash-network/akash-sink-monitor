@@ -30,7 +30,7 @@ import {
 import { pauseImport, squadsUrl, pausePanelUrl } from "./pause";
 import { createHash } from "node:crypto";
 import { pda } from "../vendor/common";
-import { rejectedDeposits } from "./rejections";
+import { rejectedDeposits } from "./transactions";
 import { metrics, serve } from "./http";
 import { once } from "node:events";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
@@ -41,6 +41,10 @@ import { statusAddress } from "../vendor/proof";
 import idl from "../idl/akt.json";
 import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { toBech32 } from "@cosmjs/encoding";
+import { recordReports, reporterHealth } from "./reporters";
+import { queueSummary, summaryText } from "./summary";
+import { Script } from "node:vm";
 
 const config = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
@@ -72,6 +76,7 @@ function snapshot(): Snapshot {
       trustingPeriodSeconds: 1209600,
       program: config.lightClientProgramId,
     },
+    reporters: { version: "1", members: [], quorum: 0 },
     caps: [],
     transfers: [],
     burns: [],
@@ -104,6 +109,7 @@ function state(): MonitorState {
     identity: "test",
     startedAt: 0,
     rejectionHeight: 0,
+    reporterActivity: null,
     snapshot: null,
     active: {},
     delivered: {},
@@ -338,7 +344,7 @@ test("public metrics expose units and pending deliveries, not Slack message bodi
   const s = state();
   s.snapshot = snapshot();
   updateAlerts(s, [critical], config, 1000);
-  const output = metrics(s, false);
+  const output = metrics(s, false, config);
   assert(output.includes("akash_sink_monitor_fresh 0"));
   assert(output.includes("akash_sink_monitor_outbox_pending 1"));
   assert(!output.includes("base58"));
@@ -468,11 +474,20 @@ test("HTTP dashboard serves pause import and links, rejects writes, and marks st
     s.snapshot = { ...snapshot(), checkedAt: new Date().toISOString() };
     assert.equal((await fetch(root + "/healthz")).status, 200);
     const status = z
-      .object({ squadsUrl: z.string(), pauseImport: z.string() })
+      .object({
+        squadsUrl: z.string(),
+        pauseImport: z.string(),
+        health: z.array(z.string()),
+      })
       .parse(await (await fetch(root + "/status")).json());
     assert.equal(status.squadsUrl, squadsUrl(config));
     assert.equal(status.pauseImport, pauseImport(config));
-    assert((await (await fetch(root)).text()).includes('id="copy-pause"'));
+    assert(status.health.some((line) => line.includes("Light client: active")));
+    const html = await (await fetch(root)).text();
+    assert(html.includes('id="copy-pause"'));
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    assert(script);
+    new Script(script);
     assert.equal(
       (await fetch(root + "/status", { method: "POST" })).status,
       405,
@@ -750,4 +765,219 @@ test("burn links recover from persisted receipts even after the index advanced b
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("periodic summaries survive restarts and wait two hours after delivery", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  queueSummary(s, config, now);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /Light client: active/);
+  const id = s.outbox[0].id;
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      webhook: "https://hooks.slack.com/services/TEST",
+      post: async () => new Response("invalid_token", { status: 400 }),
+      persist: async () => {},
+    }),
+  );
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  const later = now + 3 * 3600_000;
+  queueSummary(s, config, later);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].id, id);
+  assert.match(s.outbox[0].text, /Observation: STALE/);
+  assert.match(s.outbox[0].text, /current bridge health is unknown/);
+  let persisted = "";
+  await deliverOutbox({
+    state: s,
+    webhook: "https://hooks.slack.com/services/TEST",
+    post: async (_url, init) => {
+      assert.match(String(init?.body), /Observation: STALE/);
+      return new Response("ok");
+    },
+    persist: async () => {
+      persisted = JSON.stringify(s);
+    },
+    now: () => later,
+  });
+  s = monitorStateSchema.parse(JSON.parse(persisted));
+  queueSummary(s, config, later + 7200_000 - 1);
+  assert.equal(s.outbox.length, 0);
+  queueSummary(s, config, later + 7200_000);
+  assert.equal(s.outbox.length, 1);
+  assert.notEqual(s.outbox[0].id, id);
+});
+
+test("summary reports unknown observations and escapes untrusted alert text", () => {
+  const s = state();
+  s.active.example = { ...critical, title: "<@U123> & danger" };
+  const text = summaryText(s, config, 0);
+  assert.match(text, /no complete snapshot yet/);
+  assert.match(text, /1 critical, 0 warning/);
+  assert.match(text, /&lt;@U123&gt; &amp; danger/);
+  assert(!text.includes("Light client: active"));
+});
+
+test("idle header lag is visible without treating normal inactivity as a failure", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  s.snapshot.akashHeight = 10000;
+  s.snapshot.client.ageSeconds = 86400;
+  assert.deepEqual(evaluate(s.snapshot, config), []);
+  const text = summaryText(s, config, Date.parse(s.snapshot.checkedAt));
+  assert.match(text, /age 24h 0m, 9900 blocks behind Akash/);
+  s.snapshot.client.ageSeconds = s.snapshot.client.trustingPeriodSeconds / 4;
+  assert.equal(
+    evaluate(s.snapshot, config).find((a) => a.key === "client")?.severity,
+    "warning",
+  );
+  s.snapshot.client.status = "expired";
+  assert.equal(
+    evaluate(s.snapshot, config).find((a) => a.key === "client")?.severity,
+    "critical",
+  );
+});
+
+test("reporter activity counts successful events, deduplicates members and expires old reports", () => {
+  const alice = toBech32("akash", new Uint8Array(20).fill(1));
+  const bob = toBech32("akash", new Uint8Array(20).fill(2));
+  const retired = toBech32("akash", new Uint8Array(20).fill(3));
+  const event = (reporter: string) => ({
+    type: "akash.sink.v1.EventOutcomeReported",
+    attributes: [{ key: "reporter", value: JSON.stringify(reporter) }],
+  });
+  const initial = recordReports(null, 10, 10000, [
+    { code: 0, events: [event(alice), event(alice), event(retired)] },
+    { code: 5, events: [event(bob)] },
+  ]);
+  assert.equal(Object.keys(initial.lastReportAt).length, 2);
+  const s = state();
+  s.snapshot = snapshot();
+  s.snapshot.reporters = { version: "2", members: [alice, bob], quorum: 2 };
+  s.snapshot.checkedAt = new Date(10000_000).toISOString();
+  s.snapshot.akashHeight = 10;
+  s.reporterActivity = initial;
+  assert.deepEqual(reporterHealth(s, config, 10000_000), {
+    authorized: 2,
+    quorum: 2,
+    recentlyReported: 1,
+    coverageSeconds: 0,
+    fresh: true,
+    completeWindow: false,
+  });
+  s.reporterActivity = recordReports(initial, 20, 17201, []);
+  s.snapshot.akashHeight = 20;
+  s.snapshot.checkedAt = new Date(17201_000).toISOString();
+  const health = reporterHealth(s, config, 17201_000);
+  assert.equal(health.recentlyReported, 0);
+  assert.equal(health.completeWindow, true);
+  assert.equal(health.coverageSeconds, 7200);
+  assert.equal(Object.keys(s.reporterActivity.lastReportAt).length, 0);
+  s.snapshot.akashHeight = 21;
+  assert.equal(reporterHealth(s, config, 17201_000).completeWindow, false);
+  assert.match(summaryText(s, config, 17201_000), /index stale or catching up/);
+  assert.equal(
+    reporterHealth(s, config, 17201_000 + config.staleSeconds * 1000).fresh,
+    false,
+  );
+});
+
+test("malformed successful report events fail closed instead of inventing an active reporter", () => {
+  assert.throws(() =>
+    recordReports(null, 10, 10000, [
+      {
+        code: 0,
+        events: [
+          { type: "akash.sink.v1.EventOutcomeReported", attributes: [] },
+        ],
+      },
+    ]),
+  );
+  assert.throws(() =>
+    recordReports(null, 10, 10000, [
+      {
+        code: 0,
+        events: [
+          {
+            type: "akash.sink.v1.EventOutcomeReported",
+            attributes: [{ key: "reporter", value: '"not-an-address"' }],
+          },
+        ],
+      },
+    ]),
+  );
+});
+
+test("pre-summary saved state migrates without claiming an empty reporter policy", () => {
+  const old = JSON.parse(JSON.stringify({ ...state(), snapshot: snapshot() }));
+  delete old.reporterActivity;
+  delete old.snapshot.reporters;
+  const parsed = monitorStateSchema.parse(old);
+  assert.equal(parsed.reporterActivity, null);
+  assert.equal(parsed.snapshot?.reporters, null);
+  assert.match(summaryText(parsed, config, 0), /Reporters: unknown authorized/);
+});
+
+test("Prometheus exposes header, client and reporter state without reporter address labels", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  s.snapshot.client.status = "frozen";
+  s.snapshot.client.height = "90";
+  s.snapshot.reporters = {
+    version: "3",
+    members: ["reporter-identity"],
+    quorum: 1,
+  };
+  s.reporterActivity = {
+    since: 1000,
+    through: 8200,
+    height: 100,
+    lastReportAt: { "reporter-identity": 8199 },
+  };
+  s.snapshot.checkedAt = new Date(8200_000).toISOString();
+  const text = metrics(s, true, config, 8200_000);
+  assert.match(text, /akash_sink_client_status\{status="frozen"\} 1/);
+  assert.match(text, /akash_sink_client_header_lag_blocks 10/);
+  assert.match(text, /akash_sink_reporters_authorized 1/);
+  assert.match(text, /akash_sink_reporters_recently_reported 1/);
+  assert.match(text, /akash_sink_reporter_activity_fresh 1/);
+  assert.match(text, /akash_sink_reporter_activity_coverage_seconds 7200/);
+  assert.match(text, /akash_sink_monitor_summary_interval_seconds 7200/);
+  assert(!text.includes("reporter-identity"));
+});
+
+test("a hung observation still delivers a due summary after immediate critical alerts", async () => {
+  const s = state();
+  updateAlerts(s, [critical], config, 0);
+  let resolve: (() => void) | undefined;
+  const observation = new Promise<void>((done) => {
+    resolve = done;
+  });
+  const delivered: string[] = [];
+  await withObservationWatchdog(
+    observation,
+    async () => {
+      queueSummary(s, config, 7200_000);
+      await deliverOutbox({
+        state: s,
+        webhook: "https://hooks.slack.com/services/TEST",
+        post: async (_url, init) => {
+          delivered.push(String(init?.body));
+          return new Response("ok");
+        },
+        persist: async () => {},
+        now: () => 7200_000,
+      });
+      resolve?.();
+    },
+    5,
+  );
+  assert.equal(delivered.length, 2);
+  assert.match(delivered[0], /CRITICAL: Backing mismatch/);
+  assert.match(delivered[1], /summary/);
+  assert.match(delivered[1], /no complete snapshot yet/);
+  assert.equal(s.delivered.summary.sentAt, 7200_000);
 });

@@ -76,6 +76,14 @@ export const snapshotSchema = z.object({
     trustingPeriodSeconds: z.number().positive(),
     program: z.string(),
   }),
+  reporters: z
+    .object({
+      version: uint,
+      members: z.array(z.string()),
+      quorum: z.number().int().nonnegative(),
+    })
+    .nullable()
+    .default(null),
   guardian: z.string().nullable(),
   nativeGuardian: z.string(),
   caps: z.array(capSchema),
@@ -86,11 +94,20 @@ export type Snapshot = z.infer<typeof snapshotSchema>;
 export type Transfer = z.infer<typeof transferSchema>;
 export type Cap = z.infer<typeof capSchema>;
 
+export const reporterActivitySchema = z.object({
+  since: z.number().int(),
+  through: z.number().int(),
+  height: z.number().int().nonnegative(),
+  lastReportAt: z.record(z.string(), z.number().int()),
+});
+export type ReporterActivity = z.infer<typeof reporterActivitySchema>;
+
 export const monitorStateSchema = z.object({
   version: z.literal(1),
   identity: z.string(),
   startedAt: z.number(),
   rejectionHeight: z.number().int().nonnegative(),
+  reporterActivity: reporterActivitySchema.nullable().default(null),
   snapshot: snapshotSchema.nullable(),
   active: z.record(z.string(), alertSchema),
   delivered: z.record(
