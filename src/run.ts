@@ -139,11 +139,7 @@ export async function run(
     };
     const watchdog = async () => {
       const now = Date.now();
-      const lastSuccess = state.snapshot
-        ? Date.parse(state.snapshot.checkedAt)
-        : state.startedAt;
-      if (now - lastSuccess >= config.staleSeconds * 1000)
-        observationUnavailable(state, config, now);
+      observationUnavailable(state, config, now);
       if (options.notify && !options.once) queueSummary(state, config, now);
       await persist();
       await notify();
@@ -210,12 +206,7 @@ export async function run(
                 fingerprint: event.id,
                 now,
                 text:
-                  "*Rejected Akash deposit*\n" +
-                  event.detail
-                    .replaceAll("&", "&amp;")
-                    .replaceAll("<", "&lt;")
-                    .replaceAll(">", "&gt;") +
-                  "\n" +
+                  "*🔴 Deposit rejected*\n\nThe deposit was not accepted on Akash.\n\n" +
                   akashTxLink(event.txHash, config),
               });
             }
@@ -223,16 +214,16 @@ export async function run(
               alerts.push({
                 key: "rejection-index",
                 severity: "warning",
-                title: "Transaction and reporter index catching up",
-                detail: `Indexed height ${indexed.height}, latest ${snapshot.akashHeight}.`,
+                title: "Catching up on transaction history",
+                detail: `${snapshot.akashHeight - indexed.height} blocks left to scan. Reporter activity will update as the scan completes.`,
               });
           } catch {
             alerts.push({
               key: "rejection-index",
               severity: "critical",
-              title: "Transaction and reporter history unavailable",
+              title: "Transaction history is unavailable",
               detail:
-                "History cursor has not advanced; reporter activity is incomplete. Configure an RPC retaining block results. Accounting checks remain independent.",
+                "Reporter activity cannot update. Check that the Akash RPC retains historical block results.",
             });
           }
           updateAlerts(state, alerts, config, now);
@@ -251,7 +242,9 @@ export async function run(
           });
         } catch {
           const alert = observationUnavailable(state, config, Date.now());
-          log("observation-unavailable", { severity: alert.severity });
+          log("observation-unavailable", {
+            severity: alert?.severity ?? "retrying",
+          });
         }
         if (options.notify && !options.once)
           queueSummary(state, config, Date.now());

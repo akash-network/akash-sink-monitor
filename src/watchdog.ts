@@ -1,6 +1,7 @@
 import type { Config } from "./config";
 import type { Alert, MonitorState } from "./model";
 import { updateAlerts } from "./alerts";
+import { formatDuration } from "./format";
 
 export function observationUnavailable(
   state: MonitorState,
@@ -10,13 +11,17 @@ export function observationUnavailable(
   const lastSuccess = state.snapshot
     ? Date.parse(state.snapshot.checkedAt)
     : state.startedAt;
+  const threshold = state.snapshot
+    ? config.staleSeconds
+    : config.startupGraceSeconds;
+  if (now - lastSuccess < threshold * 1000) return;
   const alert: Alert = {
     key: "observation-unavailable",
-    severity:
-      now - lastSuccess >= config.staleSeconds * 1000 ? "critical" : "warning",
-    title: "Bridge monitoring cannot verify current state",
-    detail:
-      "RPC data unavailable, stale, inconsistent, or history incomplete. Existing financial alerts remain active; this is not proof of a backing deficit.",
+    severity: "critical",
+    title: state.snapshot
+      ? "Bridge updates have stopped"
+      : "Sink monitor couldn’t connect",
+    detail: `${state.snapshot ? `No new bridge data for ${formatDuration((now - lastSuccess) / 1000)}.` : "The first bridge check hasn’t completed."}\nCheck the Akash and Solana RPC connections.`,
   };
   updateAlerts(
     state,

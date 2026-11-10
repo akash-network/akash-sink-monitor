@@ -43,6 +43,7 @@ export const configSchema = z
     stateDir: z.string().refine(isAbsolute),
     intervalSeconds: z.number().int().min(5).default(15),
     staleSeconds: z.number().int().min(30).default(120),
+    startupGraceSeconds: z.number().int().min(30).default(300),
     pendingWarningSeconds: z.number().int().positive().default(300),
     pendingCriticalSeconds: z.number().int().positive().default(900),
     reportLagSeconds: z.number().int().positive().default(600),

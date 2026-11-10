@@ -1,17 +1,13 @@
 import type { Config } from "./config";
-import { akt, type MonitorState } from "./model";
+import type { MonitorState } from "./model";
 import { queueMessage } from "./alerts";
 import { reporterHealth } from "./reporters";
-
-const escape = (text: string) =>
-  text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-
-function duration(seconds: number): string {
-  const minutes = Math.floor(Math.max(0, seconds) / 60);
-  if (minutes < 1) return `${Math.floor(Math.max(0, seconds))}s`;
-  if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
+import {
+  formatAkt,
+  formatDuration as duration,
+  slackEscape,
+  statusLabel,
+} from "./format";
 
 export function healthLines(
   state: MonitorState,
@@ -44,51 +40,112 @@ export function summaryText(
   config: Config,
   now: number,
 ): string {
+  const s = state.snapshot;
+  const fresh =
+    !!s && now - Date.parse(s.checkedAt) < config.staleSeconds * 1000;
   const alerts = Object.values(state.active).sort(
     (a, b) =>
       Number(b.severity === "critical") - Number(a.severity === "critical"),
   );
-  const critical = alerts.filter(
-    (alert) => alert.severity === "critical",
-  ).length;
-  const lines = [
-    `Akash Sink · ${duration(config.summaryIntervalSeconds)} summary · ${new Date(now).toISOString()}`,
-    ...healthLines(state, config, now),
-    `Alerts: ${critical} critical, ${alerts.length - critical} warning.`,
-    ...alerts
-      .slice(0, 5)
-      .map((alert) => `${alert.severity.toUpperCase()}: ${alert.title}`),
-    ...(alerts.length > 5
-      ? [`Plus ${alerts.length - 5} more alerts; see the dashboard.`]
-      : []),
-  ];
-  const s = state.snapshot;
-  if (s) {
+  const icon =
+    !fresh || alerts.some((alert) => alert.severity === "critical")
+      ? "🔴"
+      : alerts.length
+        ? "🟠"
+        : "🟢";
+  const title = !fresh
+    ? "Updates unavailable"
+    : alerts.length
+      ? "Needs attention"
+      : "All clear";
+  const sections = [`*${icon} Akash Sink · ${title}*`];
+  if (!fresh) {
+    sections.push(
+      s
+        ? `No new bridge data for *${duration((now - Date.parse(s.checkedAt)) / 1000)}*.\nCheck the RPC connections. Balances below are from the last successful check.`
+        : "Waiting for the first bridge check.\nCheck the Akash and Solana RPC connections.",
+    );
+  } else if (s) {
+    const lag = BigInt(s.akashHeight) - BigInt(s.client.height);
+    sections.push(
+      `*Light client*\n${statusLabel(s.client.status)} · header age ${duration(s.client.ageSeconds)} · trust remaining ${duration(s.client.trustingPeriodSeconds - s.client.ageSeconds)}\nHeader ${BigInt(s.client.height).toLocaleString("en-US")} · ${(lag > 0n ? lag : 0n).toLocaleString("en-US")} blocks behind`,
+    );
+    const reporters = reporterHealth(state, config, now);
+    const activity =
+      reporters.recentlyReported === null
+        ? "Collecting report history"
+        : `${reporters.recentlyReported} reported in the last 2h${reporters.completeWindow ? "" : reporters.fresh ? ` · ${duration(reporters.coverageSeconds)} tracked so far` : " · history catching up"}`;
+    sections.push(
+      `*Reporters*\n${reporters.authorized ?? "Unknown"} authorized · quorum ${reporters.quorum ?? "unknown"}\n${activity}`,
+    );
     const pending = s.transfers.filter((t) =>
       ["STATUS_TRANSFER_PENDING", "STATUS_VOIDED"].includes(t.akash),
     );
-    lines.push(
-      `Transfers: ${pending.filter((t) => t.solana === "pending").length} awaiting Solana; ${pending.filter((t) => t.solana !== "pending").length} awaiting reports; ${s.transfers.filter((t) => t.akash === "STATUS_REFUND_PENDING").length} refund pending; ${s.transfers.filter((t) => t.hold !== "HOLD_NONE").length} held.`,
-      `AKT: escrow ${akt(s.lockedUakt)}; supply ${akt(s.supplyUakt)}; pending ${akt(s.pendingUakt)}; refund pending ${akt(s.refundPendingUakt)}.`,
-      `Enabled: deposits ${s.depositsEnabled ? "yes" : "no"}; minting ${s.mintingEnabled ? "yes" : "no"}; refunds ${s.refundsEnabled ? "yes" : "no"}.`,
+    const held = s.transfers.filter((t) => t.hold !== "HOLD_NONE").length;
+    sections.push(
+      `*Transfers*\n${pending.filter((t) => t.solana === "pending").length} pending · ${pending.filter((t) => t.solana !== "pending").length} awaiting reports · ${s.transfers.filter((t) => t.akash === "STATUS_REFUND_PENDING").length} refunds pending${held ? ` · ${held} held for review` : ""}`,
     );
-    for (const cap of s.caps.filter((cap) =>
+    const paused = [
+      !s.depositsEnabled ? "deposits" : "",
+      !s.mintingEnabled ? "minting" : "",
+      !s.refundsEnabled ? "refunds" : "",
+    ].filter(Boolean);
+    sections.push(
+      `*Bridge*\nEscrow: *${formatAkt(s.lockedUakt)} AKT* · Supply: *${formatAkt(s.supplyUakt)} AKT*\n${paused.length ? `Paused: ${paused.join(", ")}` : "Deposits, minting and refunds enabled"}`,
+    );
+    const caps = s.caps.filter((cap) =>
       ["akash-send", "akash-refund", "solana-mint"].includes(cap.key),
-    ))
-      lines.push(
-        `${cap.label}: ${akt(cap.usedUakt)} / ${akt(cap.limitUakt)} AKT.`,
+    );
+    if (caps.length)
+      sections.push(
+        "*Daily usage*\n" +
+          caps
+            .map(
+              (cap) =>
+                `${slackEscape(cap.label)}: ${formatAkt(cap.usedUakt)} / ${formatAkt(cap.limitUakt)} AKT`,
+            )
+            .join("\n"),
       );
   }
-  lines.push(
-    `Slack queue: ${state.outbox.filter((message) => message.key !== "summary").length} other notifications pending.`,
+  if (s && !fresh)
+    sections.push(
+      `*Last confirmed balances*\nEscrow: ${formatAkt(s.lockedUakt)} AKT · Supply: ${formatAkt(s.supplyUakt)} AKT`,
+    );
+  const issues = alerts.filter(
+    (alert) => alert.key !== "observation-unavailable",
   );
-  return (
-    lines.map(escape).join("\n") +
-    (config.publicUrl ? `\n<${config.publicUrl}|Dashboard>` : "")
-  );
+  if (issues.length)
+    sections.push(
+      "*Open issues*\n" +
+        issues
+          .slice(0, 5)
+          .map((alert) => `• ${slackEscape(alert.title)}`)
+          .join("\n") +
+        (issues.length > 5
+          ? `\nPlus ${issues.length - 5} more in the dashboard`
+          : ""),
+    );
+  if (config.publicUrl) sections.push(`<${config.publicUrl}|Open dashboard>`);
+  return sections.join("\n\n");
 }
 
 export function queueSummary(state: MonitorState, config: Config, now: number) {
+  if (!state.snapshot) {
+    state.outbox = state.outbox.filter(
+      (message) => message.key !== "summary" && message.key !== "baseline",
+    );
+    return;
+  }
+  const recovery = state.outbox.some(
+    (message) =>
+      message.key === "alert:observation-unavailable" &&
+      message.fingerprint === "resolved",
+  );
+  state.outbox = state.outbox.filter(
+    (message) =>
+      message.key !== "baseline" &&
+      !(recovery && message.key === "alert:observation-unavailable"),
+  );
   const pending = state.outbox.find((message) => message.key === "summary");
   if (pending) {
     pending.text = summaryText(state, config, now);
@@ -96,6 +153,7 @@ export function queueSummary(state: MonitorState, config: Config, now: number) {
   }
   const delivered = state.delivered.summary;
   if (
+    !recovery &&
     delivered &&
     now - delivered.sentAt < config.summaryIntervalSeconds * 1000
   )

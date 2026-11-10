@@ -45,6 +45,7 @@ import { toBech32 } from "@cosmjs/encoding";
 import { recordReports, reporterHealth } from "./reporters";
 import { queueSummary, summaryText } from "./summary";
 import { Script } from "node:vm";
+import { formatAkt } from "./format";
 
 const config = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
@@ -212,12 +213,13 @@ test("frozen client and changed guardian are critical", () => {
     ["client", "guardian"],
   );
 });
-test("critical mention is the exact Slack member ID and includes unsigned pause bytes", () => {
+test("critical alerts keep the operator mention and pause links without dumping transaction bytes", () => {
   const cfg = { ...config, slackMemberId: "U12345678" };
   const text = alertText(critical, cfg, state());
   assert(text.includes("<@U12345678>"));
-  assert(text.includes(pauseImport(config)));
-  assert(text.includes("does NOT pause Akash"));
+  assert(text.includes(squadsUrl(config)));
+  assert(!text.includes(pauseImport(config)));
+  assert.match(text, /\*🔴 Backing mismatch\*\n\n/);
   assert(
     !alertText({ ...critical, severity: "warning" }, cfg, state()).includes(
       "<@",
@@ -411,8 +413,8 @@ test("an outage preserves financial alarms and escalates missing observations", 
   updateAlerts(s, [critical], config, 0);
   observationUnavailable(s, config, 1000);
   assert.equal(s.active.backing.severity, "critical");
-  assert.equal(s.active["observation-unavailable"].severity, "warning");
-  observationUnavailable(s, config, config.staleSeconds * 1000);
+  assert(!Object.hasOwn(s.active, "observation-unavailable"));
+  observationUnavailable(s, config, config.startupGraceSeconds * 1000);
   assert.equal(s.active["observation-unavailable"].severity, "critical");
   assert(!s.outbox.some((row) => row.fingerprint === "resolved"));
 });
@@ -661,7 +663,7 @@ test("receipt links arrive after an unavailable lookup, persist and do not repea
   const next = snapshot();
   next.transfers = [receiptTransfer()];
   updateTransfers(s, next, 1, config);
-  assert.match(s.outbox[0].text, /lookup unavailable/);
+  assert(!s.outbox[0].text.includes("https://"));
   s.snapshot = next;
   s.outbox = [];
   const linked = structuredClone(next);
@@ -671,7 +673,9 @@ test("receipt links arrive after an unavailable lookup, persist and do not repea
   linked.transfers[0].solanaTxSignature = receiptSignature;
   updateTransfers(s, linked, 2, config);
   const message = s.outbox[0].text;
-  assert(message.includes(akashTxLink("A".repeat(64), config)));
+  assert(
+    message.includes(akashTxLink("A".repeat(64), config, "Original deposit")),
+  );
   assert(message.includes(solanaTxLink(receiptSignature, config)));
   s.snapshot = linked;
   const restored = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
@@ -684,7 +688,8 @@ test("receipt links arrive after an unavailable lookup, persist and do not repea
     ),
   );
   const refunded = { ...linked.transfers[0], akash: "STATUS_REFUNDED" };
-  assert.match(transferLinks(refunded, config), /not a refund transaction/);
+  assert.match(transferLinks(refunded, config), /Original deposit/);
+  assert(!transferLinks(refunded, config).includes("Refund transaction"));
 });
 
 test("delayed receipt without a status change gets one follow-up notice", () => {
@@ -694,7 +699,7 @@ test("delayed receipt without a status change gets one follow-up notice", () => 
   const next = structuredClone(s.snapshot);
   next.transfers[0].depositTxHash = "B".repeat(64);
   updateTransfers(s, next, 1, config);
-  assert.match(s.outbox[0].text, /transaction links available/);
+  assert.match(s.outbox[0].text, /Transfer receipts available/);
   s.snapshot = next;
   updateTransfers(s, next, 2, config);
   assert.equal(s.outbox.length, 1);
@@ -761,7 +766,7 @@ test("burn links recover from persisted receipts even after the index advanced b
     const missing = state();
     missing.snapshot = previous;
     updateTransfers(missing, { ...next, burns: [] }, 2, config);
-    assert.match(missing.outbox[0].text, /receipt coverage incomplete/);
+    assert.match(missing.outbox[0].text, /Some burn receipts are missing/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -773,7 +778,7 @@ test("periodic summaries survive restarts and wait two hours after delivery", as
   const now = Date.parse(s.snapshot.checkedAt);
   queueSummary(s, config, now);
   assert.equal(s.outbox.length, 1);
-  assert.match(s.outbox[0].text, /Light client: active/);
+  assert.match(s.outbox[0].text, /\*Light client\*\nActive/);
   const id = s.outbox[0].id;
   await assert.rejects(
     deliverOutbox({
@@ -788,14 +793,14 @@ test("periodic summaries survive restarts and wait two hours after delivery", as
   queueSummary(s, config, later);
   assert.equal(s.outbox.length, 1);
   assert.equal(s.outbox[0].id, id);
-  assert.match(s.outbox[0].text, /Observation: STALE/);
-  assert.match(s.outbox[0].text, /current bridge health is unknown/);
+  assert.match(s.outbox[0].text, /Updates unavailable/);
+  assert.match(s.outbox[0].text, /last successful check/);
   let persisted = "";
   await deliverOutbox({
     state: s,
     webhook: "https://hooks.slack.com/services/TEST",
     post: async (_url, init) => {
-      assert.match(String(init?.body), /Observation: STALE/);
+      assert.match(String(init?.body), /Updates unavailable/);
       return new Response("ok");
     },
     persist: async () => {
@@ -815,8 +820,8 @@ test("summary reports unknown observations and escapes untrusted alert text", ()
   const s = state();
   s.active.example = { ...critical, title: "<@U123> & danger" };
   const text = summaryText(s, config, 0);
-  assert.match(text, /no complete snapshot yet/);
-  assert.match(text, /1 critical, 0 warning/);
+  assert.match(text, /Waiting for the first bridge check/);
+  assert.match(text, /\*Open issues\*/);
   assert.match(text, /&lt;@U123&gt; &amp; danger/);
   assert(!text.includes("Light client: active"));
 });
@@ -828,7 +833,8 @@ test("idle header lag is visible without treating normal inactivity as a failure
   s.snapshot.client.ageSeconds = 86400;
   assert.deepEqual(evaluate(s.snapshot, config), []);
   const text = summaryText(s, config, Date.parse(s.snapshot.checkedAt));
-  assert.match(text, /age 24h 0m, 9900 blocks behind Akash/);
+  assert.match(text, /header age 1d/);
+  assert.match(text, /9,900 blocks behind/);
   s.snapshot.client.ageSeconds = s.snapshot.client.trustingPeriodSeconds / 4;
   assert.equal(
     evaluate(s.snapshot, config).find((a) => a.key === "client")?.severity,
@@ -878,7 +884,7 @@ test("reporter activity counts successful events, deduplicates members and expir
   assert.equal(Object.keys(s.reporterActivity.lastReportAt).length, 0);
   s.snapshot.akashHeight = 21;
   assert.equal(reporterHealth(s, config, 17201_000).completeWindow, false);
-  assert.match(summaryText(s, config, 17201_000), /index stale or catching up/);
+  assert.match(summaryText(s, config, 17201_000), /history catching up/);
   assert.equal(
     reporterHealth(s, config, 17201_000 + config.staleSeconds * 1000).fresh,
     false,
@@ -918,7 +924,7 @@ test("pre-summary saved state migrates without claiming an empty reporter policy
   const parsed = monitorStateSchema.parse(old);
   assert.equal(parsed.reporterActivity, null);
   assert.equal(parsed.snapshot?.reporters, null);
-  assert.match(summaryText(parsed, config, 0), /Reporters: unknown authorized/);
+  assert.match(summaryText(parsed, config, 0), /Unknown authorized/);
 });
 
 test("Prometheus exposes header, client and reporter state without reporter address labels", () => {
@@ -951,6 +957,7 @@ test("Prometheus exposes header, client and reporter state without reporter addr
 
 test("a hung observation still delivers a due summary after immediate critical alerts", async () => {
   const s = state();
+  s.snapshot = { ...snapshot(), checkedAt: new Date(0).toISOString() };
   updateAlerts(s, [critical], config, 0);
   let resolve: (() => void) | undefined;
   const observation = new Promise<void>((done) => {
@@ -976,8 +983,93 @@ test("a hung observation still delivers a due summary after immediate critical a
     5,
   );
   assert.equal(delivered.length, 2);
-  assert.match(delivered[0], /CRITICAL: Backing mismatch/);
-  assert.match(delivered[1], /summary/);
-  assert.match(delivered[1], /no complete snapshot yet/);
+  assert.match(delivered[0], /Backing mismatch/);
+  assert.match(delivered[1], /Updates unavailable/);
+  assert.match(delivered[1], /last successful check/);
   assert.equal(s.delivered.summary.sentAt, 7200_000);
+});
+
+test("startup is quiet until its grace period ends and suppresses empty summaries", () => {
+  const s = state();
+  observationUnavailable(s, config, config.startupGraceSeconds * 1000 - 1);
+  queueSummary(s, config, config.startupGraceSeconds * 1000 - 1);
+  assert.equal(s.outbox.length, 0);
+  const alert = observationUnavailable(
+    s,
+    config,
+    config.startupGraceSeconds * 1000,
+  );
+  queueSummary(s, config, config.startupGraceSeconds * 1000);
+  assert.equal(alert?.severity, "critical");
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /couldn’t connect/);
+  assert(!s.outbox[0].text.includes("Squad"));
+  assert(!s.outbox[0].text.includes("backing deficit"));
+});
+
+test("brief RPC interruptions stay quiet, while stale observations still alert", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  observationUnavailable(s, config, now + config.staleSeconds * 1000 - 1);
+  assert.equal(s.outbox.length, 0);
+  const alert = observationUnavailable(
+    s,
+    config,
+    now + config.staleSeconds * 1000,
+  );
+  assert.equal(alert?.severity, "critical");
+  assert.match(s.outbox[0].text, /Bridge updates have stopped/);
+});
+
+test("first connection coalesces recovery and baseline into one useful update", async () => {
+  const s = state();
+  const initial = snapshot();
+  const now = Date.parse(initial.checkedAt);
+  observationUnavailable(s, config, now - 1000);
+  await deliverOutbox({
+    state: s,
+    webhook: "https://hooks.slack.com/services/TEST",
+    persist: async () => {},
+    post: async () => new Response("ok"),
+    now: () => now - 1000,
+  });
+  updateTransfers(s, initial, now, config);
+  s.snapshot = initial;
+  updateAlerts(s, [], config, now);
+  queueSummary(s, config, now);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "summary");
+  assert.match(s.outbox[0].text, /All clear/);
+  assert.match(s.outbox[0].text, /\*Light client\*\n/);
+  let deliveredId = "";
+  await deliverOutbox({
+    state: s,
+    webhook: "https://hooks.slack.com/services/TEST",
+    persist: async () => {},
+    post: async (_url, init) => {
+      const body = z
+        .object({ text: z.string() })
+        .parse(JSON.parse(String(init?.body)));
+      deliveredId = s.outbox[0].id;
+      assert(!body.text.includes(deliveredId));
+      assert(!body.text.includes("Event ID"));
+      assert(!body.text.includes("baseline"));
+      assert(!body.text.includes("Slack queue"));
+      assert(!body.text.includes(".000000"));
+      return new Response("ok");
+    },
+    now: () => now,
+  });
+  assert.match(deliveredId, /^[a-f0-9]{64}$/);
+  const restarted = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  queueSummary(restarted, config, now + 1);
+  assert.equal(restarted.outbox.length, 0);
+});
+
+test("human-readable AKT amounts keep every micro-unit, including large balances", () => {
+  assert.equal(formatAkt("13000000"), "13");
+  assert.equal(formatAkt("1000001"), "1.000001");
+  assert.equal(formatAkt("-1"), "-0.000001");
+  assert.equal(formatAkt("9500000000000000001"), "9,500,000,000,000.000001");
 });

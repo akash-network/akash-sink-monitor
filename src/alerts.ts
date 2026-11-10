@@ -1,21 +1,20 @@
 import { createHash } from "node:crypto";
 import type { Config } from "./config";
-import { akt, type Alert, type MonitorState, type Snapshot } from "./model";
+import type { Alert, MonitorState, Snapshot, Transfer } from "./model";
 import { squadsUrl, pausePanelUrl } from "./pause";
-import { observationLinks, solanaTxLink, transferLinks } from "./links";
+import { solanaTxLink, transferLinks } from "./links";
+import { formatAkt, slackEscape, statusLabel } from "./format";
 
 function evidence(alert: Alert, config: Config, state: MonitorState): string {
-  const snapshot = state.snapshot;
-  if (!snapshot) return "";
-  const transfer = snapshot.transfers.find(
+  const transfer = state.snapshot?.transfers.find(
     (row) => row.id === alert.transferId,
   );
-  return `\n${transfer ? transferLinks(transfer, config) + "\n" : ""}${observationLinks(snapshot, config)}`;
+  const links = transfer ? transferLinks(transfer, config) : "";
+  return links ? `\n\n${links}` : "";
 }
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
-const escape = (text: string) =>
-  text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
 export function alertText(
   alert: Alert,
   config: Config,
@@ -23,17 +22,39 @@ export function alertText(
 ): string {
   const mention =
     alert.severity === "critical" && config.slackMemberId
-      ? `<@${config.slackMemberId}> `
+      ? `<@${config.slackMemberId}>\n`
       : "";
+  const icon = alert.severity === "critical" ? "🔴" : "🟠";
   const panel = pausePanelUrl(config);
-  const links = `\n<${squadsUrl(config)}|Open your Squad — create a transaction>${panel ? ` · <${panel}|Copy pause import and view instructions>` : ""}`;
-  const pause =
-    alert.severity !== "critical"
-      ? ""
-      : state.pauseImport === null
-        ? "\nSquads pause import unavailable: verify the configured guardian and chain identity."
-        : `\n*Emergency action: pause new Solana mints*${links}\nNew transaction → Add instruction → Import base58 encoded tx. Vault: ${config.squadsVault}. Requires your Squad's approvals.\n\`\`\`${state.pauseImport}\`\`\`\nUnsigned instruction import only; no automatic execution. This does NOT pause Akash deposits/refunds. Use the separate Akash guardian response in the runbook. Snapshot: ${state.snapshot?.checkedAt ?? "unavailable"}.`;
-  return `${mention}*${alert.severity.toUpperCase()}: ${escape(alert.title)}*\n${escape(alert.detail)}${evidence(alert, config, state)}${pause}`;
+  const financial =
+    ["backing", "escrow", "ledger"].includes(alert.key) ||
+    alert.key.startsWith("settlement:");
+  const actions =
+    alert.severity === "critical" && financial && state.pauseImport !== null
+      ? `\n\n*Pause controls*\n${panel ? `<${panel}|Monitor dashboard> · ` : ""}<${squadsUrl(config)}|Open your Squad>`
+      : "";
+  return `${mention}*${icon} ${slackEscape(alert.title)}*\n\n${slackEscape(alert.detail)}${evidence(alert, config, state)}${actions}`;
+}
+
+function transferText(row: Transfer, config: Config, title: string): string {
+  const lines = [
+    `*${title}*`,
+    "",
+    `*Amount:* ${formatAkt(row.amountUakt)} AKT`,
+    `*Status:* ${statusLabel(row.akash)} · Solana ${row.solana}`,
+    `*Recipient:* ${slackEscape(row.recipient)}`,
+  ];
+  if (row.hold !== "HOLD_NONE")
+    lines.push(
+      `*Hold:* ${slackEscape(statusLabel(row.hold))}${row.vetoReason ? " — " + slackEscape(row.vetoReason) : ""}`,
+    );
+  if (row.akash === "STATUS_REFUND_PENDING" && row.challengeEnd !== "0")
+    lines.push(
+      `*Refund eligible:* <!date^${row.challengeEnd}^{date_short_pretty} at {time}|after the challenge period>`,
+    );
+  const links = transferLinks(row, config);
+  if (links) lines.push("", links);
+  return lines.join("\n");
 }
 
 export function queueMessage(
@@ -49,7 +70,10 @@ export function queueMessage(
   // An escalation replaces an undelivered lower-severity notice. A transport
   // retry retains the same message ID and is not counted as a delivery.
   const existing = state.outbox.find((row) => row.key === key);
-  if (existing?.fingerprint === fingerprint) return;
+  if (existing?.fingerprint === fingerprint) {
+    existing.text = text;
+    return;
+  }
   state.outbox = state.outbox.filter((row) => row.key !== key);
   state.outbox.push({
     id: hash(`${key}:${fingerprint}:${now}`),
@@ -75,7 +99,10 @@ export function updateAlerts(
         key: "alert:" + key,
         fingerprint: "resolved",
         now,
-        text: `*RESOLVED: ${escape(previous.title)}*\nCondition cleared in a complete fresh snapshot.${evidence(previous, config, state)}`,
+        text:
+          key === "observation-unavailable"
+            ? "*🟢 Bridge connection restored*\n\nFresh bridge data is available again."
+            : `*🟢 Resolved · ${slackEscape(previous.title)}*\n\nThe latest check is clear.${evidence(previous, config, state)}`,
       });
     }
   }
@@ -111,15 +138,7 @@ export function updateTransfers(
   config: Config,
 ) {
   const previous = state.snapshot;
-  if (!previous) {
-    queueMessage(state, {
-      key: "baseline",
-      fingerprint: next.checkedAt,
-      now,
-      text: `*akash-sink-monitor baseline*\n${next.transfers.length} existing transfers; ${akt(next.lockedUakt)} AKT escrow, ${akt(next.supplyUakt)} Solana supply. Historical transfers are baselined, not announced as new.`,
-    });
-    return;
-  }
+  if (!previous) return;
   const old = new Map(previous.transfers.map((row) => [row.id, row]));
   for (const row of next.transfers) {
     const prior = old.get(row.id);
@@ -144,7 +163,7 @@ export function updateTransfers(
       (row.depositTxHash !== prior.depositTxHash ||
         row.solanaTxSignature !== prior.solanaTxSignature);
     if (fingerprint === oldFingerprint && !receiptsChanged) continue;
-    const detail = `${row.id}: ${akt(row.amountUakt)} AKT → ${row.recipient}; Akash ${row.akash}; Solana ${row.solana}; ${row.hold}; refund challenge ends ${row.challengeEnd}.`;
+    const detail = `${row.id}: ${formatAkt(row.amountUakt)} AKT → ${row.recipient}; Akash ${row.akash}; Solana ${row.solana}; ${row.hold}; refund challenge ends ${row.challengeEnd}.`;
     const id = hash(
       [row.id, fingerprint, row.depositTxHash, row.solanaTxSignature].join(":"),
     );
@@ -155,7 +174,15 @@ export function updateTransfers(
       key: "transfer:" + id,
       fingerprint,
       now,
-      text: `*Bridge transfer ${fingerprint === oldFingerprint ? "transaction links available" : prior ? "updated" : "deposited"}*\n${escape(detail)}\n${transferLinks(row, config)}\n${observationLinks(next, config)}`,
+      text: transferText(
+        row,
+        config,
+        fingerprint === oldFingerprint
+          ? "🔗 Transfer receipts available"
+          : prior
+            ? "↔️ Bridge transfer updated"
+            : "💸 New bridge deposit",
+      ),
     });
   }
   if (BigInt(next.burnedUakt) > BigInt(previous.burnedUakt)) {
@@ -169,7 +196,7 @@ export function updateTransfers(
         key: "burn:" + burn.signature,
         fingerprint: burn.signature,
         now,
-        text: `*Solana AKT burned*\n${akt(burn.amount)} AKT burned. This is a supply reduction, not a bridge redemption or Akash refund.\n${solanaTxLink(burn.signature, config)}`,
+        text: `*🔥 Solana AKT burned*\n\n*Amount:* ${formatAkt(burn.amount)} AKT\n\n${solanaTxLink(burn.signature, config)}`,
       });
     }
     if (linked !== BigInt(delta))
@@ -177,7 +204,7 @@ export function updateTransfers(
         key: "burn:" + next.burnedUakt,
         fingerprint: next.burnedUakt,
         now,
-        text: `*Solana AKT burn receipt coverage incomplete*\nTotal increase ${akt(delta)} AKT; transaction receipts available for ${akt(linked.toString())} AKT. Inspect the persistent burn index. Burns are not bridge redemptions or Akash refunds.\n${observationLinks(next, config)}`,
+        text: `*🟠 Some burn receipts are missing*\n\n*Burned:* ${formatAkt(delta)} AKT\n*Receipts found:* ${formatAkt(linked.toString())} AKT\n\nCheck the burn history index.`,
       });
   }
 }
@@ -203,7 +230,7 @@ export async function deliverOutbox(input: {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        text: message.text + "\nEvent ID: " + message.id,
+        text: message.text,
         unfurl_links: false,
         unfurl_media: false,
       }),

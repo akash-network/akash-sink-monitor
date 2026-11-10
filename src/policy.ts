@@ -1,5 +1,6 @@
 import type { Config } from "./config";
 import type { Alert, Snapshot } from "./model";
+import { formatAkt, formatDuration, statusLabel } from "./format";
 
 export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
   const alerts: Alert[] = [];
@@ -17,7 +18,9 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       "escrow",
       escrowGap < 0n ? "critical" : "warning",
       "Akash escrow differs from recorded liabilities",
-      `Bank balance minus pending/minted/void/refund-pending liabilities: ${escrowGap} uakt. Surplus may be an unsolicited donation; a deficit is a backing failure.`,
+      escrowGap < 0n
+        ? `Escrow is short by ${formatAkt((-escrowGap).toString())} AKT.`
+        : `Escrow holds ${formatAkt(escrowGap.toString())} AKT more than recorded deposits.`,
     );
   const ledgerGap =
     BigInt(snapshot.depositedUakt) -
@@ -28,7 +31,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       "ledger",
       "critical",
       "Akash deposit history differs from settlement totals",
-      `Deposited minus recorded escrow liabilities and refunded amount: ${ledgerGap} uakt at height ${snapshot.akashHeight}.`,
+      `Deposit history and settlement totals differ by ${formatAkt(ledgerGap.toString())} AKT.`,
     );
   const backingGap =
     BigInt(snapshot.mintedUakt) -
@@ -39,7 +42,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       "backing",
       "critical",
       "Cross-chain backing mismatch",
-      `Proven minted deposits minus Solana supply and independently indexed burns: ${backingGap} uakt. Akash height ${snapshot.akashHeight}; finalized Solana slot ${snapshot.solanaSlot}.`,
+      `Recorded mints and Solana supply plus burns differ by ${formatAkt(backingGap.toString())} AKT.`,
     );
   for (const cap of snapshot.caps) {
     const used = BigInt(cap.usedUakt),
@@ -58,7 +61,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
           ? "critical"
           : "warning",
         cap.label + " approaching limit",
-        `${used} / ${limit} uakt; remaining ${limit > used ? limit - used : 0n} uakt. ${cap.period}`,
+        `Used ${formatAkt(used.toString())} of ${formatAkt(limit.toString())} AKT.\nRemaining: ${formatAkt((limit > used ? limit - used : 0n).toString())} AKT.`,
       );
     }
   }
@@ -67,7 +70,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       "client",
       "critical",
       "Light client " + snapshot.client.status,
-      "New proofs cannot be accepted; investigate header delivery/checkpoint recovery.",
+      "New transfers cannot be verified. Check the header relayer and light-client recovery status.",
     );
   else if (
     snapshot.client.ageSeconds >=
@@ -79,7 +82,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         ? "critical"
         : "warning",
       "Light client approaching expiry",
-      `Consensus age ${Math.floor(snapshot.client.ageSeconds)} seconds; trusting period ${snapshot.client.trustingPeriodSeconds} seconds.`,
+      `The latest header is ${formatDuration(snapshot.client.ageSeconds)} old.\nTrust expires in ${formatDuration(snapshot.client.trustingPeriodSeconds - snapshot.client.ageSeconds)}. Check the header relayer.`,
     );
   }
   if (snapshot.client.program !== config.lightClientProgramId)
@@ -94,7 +97,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       "guardian",
       "critical",
       "Solana pause guardian changed",
-      "Configured Squads pause payload is unavailable until authority is reviewed.",
+      "The pause guardian no longer matches the configured Squad. Review the on-chain authority.",
     );
   for (const transfer of snapshot.transfers) {
     const minted = transfer.solana === "minted";
@@ -110,7 +113,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "settlement:" + transfer.id,
         "critical",
         "Contradictory cross-chain settlement",
-        `${transfer.id}: Akash ${transfer.akash}, Solana ${transfer.solana}; ${transfer.amountUakt} uakt.`,
+        `${formatAkt(transfer.amountUakt)} AKT transfer: Akash says ${statusLabel(transfer.akash).toLowerCase()}, Solana says ${transfer.solana}.`,
         transfer.id,
       );
     if (transfer.hold !== "HOLD_NONE")
@@ -118,7 +121,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "hold:" + transfer.id,
         "critical",
         "Transfer requires governance review",
-        `${transfer.id}: ${transfer.hold}; ${transfer.vetoReason}`,
+        `${formatAkt(transfer.amountUakt)} AKT held for review.\n${statusLabel(transfer.hold)}${transfer.vetoReason ? ": " + transfer.vetoReason : ""}`,
         transfer.id,
       );
     const pending = ["STATUS_TRANSFER_PENDING", "STATUS_VOIDED"].includes(
@@ -134,7 +137,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "pending:" + transfer.id,
         age >= config.pendingCriticalSeconds ? "critical" : "warning",
         "Transfer remains unresolved",
-        `${transfer.id}: pending ${age} seconds; ${transfer.amountUakt} uakt; no finalized Solana result.`,
+        `${formatAkt(transfer.amountUakt)} AKT has been waiting ${formatDuration(age)} for confirmation on Solana.`,
         transfer.id,
       );
     }
@@ -149,7 +152,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "reporter-lag:" + transfer.id,
         "critical",
         "Reporters have not settled a finalized outcome",
-        `${transfer.id}: Solana ${transfer.solana}; Akash ${transfer.akash}; votes ${transfer.votes}/${transfer.quorum}.`,
+        `Solana: ${statusLabel(transfer.solana)}. Reporter votes: ${transfer.votes} of ${transfer.quorum}.\nAkash settlement hasn’t completed.`,
         transfer.id,
       );
     }
@@ -163,7 +166,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "refund:" + transfer.id,
         "critical",
         "Refund overdue after challenge window",
-        `${transfer.id}; check refunds enabled, FIFO queue, epoch capacity and reporter delivery. Refunds enabled: ${snapshot.refundsEnabled}.`,
+        `${formatAkt(transfer.amountUakt)} AKT refund is overdue.\n${snapshot.refundsEnabled ? "Check refund processing, available capacity and reporters." : "Refunds are currently paused."}`,
         transfer.id,
       );
     }
