@@ -1,0 +1,19 @@
+{
+  "files": {
+    "vendor/chain-sdk.tgz": "dd79a66e040eaf45bff0ab768593fb12644841748a7ccb1e10d72ceefbb43334",
+    "idl/akt.json": "d24da1ffec5b478eafcb2f63dde97a00eb5351c45fe7ea7752ced447992a8b41",
+    "idl/akt.ts": "493b59485355646931d1a00e4dd44d491cfc98b98b1aecea2b3a22b52d0bd706",
+    "idl/ics07_tendermint.json": "e6b5a03503637fa50d0f10780b3b89b4375b8e38af97ff4c9bcb66a354af5ff5",
+    "idl/ics07_tendermint.ts": "789024287ca3ef99a222f8e904cd27f603ad0e3425498dcfd231b6e453835add"
+  },
+  "idlSource": {
+    "repository": "akash-network/node",
+    "commit": "40f916e337a0bc53dbf5fa2c95a51eb51b5f1ecd",
+    "paths": {
+      "akt.json": "contracts/solana/deployments/mainnet/build/akt.json",
+      "akt.ts": "contracts/solana/deployments/mainnet/build/akt.ts",
+      "ics07_tendermint.json": "contracts/solana/idls/ics07_tendermint.json",
+      "ics07_tendermint.ts": "contracts/solana/deployments/mainnet/build/ics07_tendermint.ts"
+    }
+  }
+}

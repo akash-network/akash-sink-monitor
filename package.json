@@ -1,0 +1,35 @@
+{
+  "name": "akash-sink-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "monitor": "tsx src/run.ts",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write src vendor/*.ts scripts/*.mjs package.json tsconfig.json",
+    "format:check": "prettier --check src vendor/*.ts scripts/*.mjs package.json tsconfig.json",
+    "verify:vendor": "node scripts/check-vendor.mjs",
+    "verify": "npm run verify:vendor && npm run typecheck && npm test && npm run format:check"
+  },
+  "dependencies": {
+    "@akashnetwork/chain-sdk": "file:vendor/chain-sdk.tgz",
+    "@coral-xyz/anchor": "0.32.1",
+    "@cosmjs/encoding": "0.39.0",
+    "@cosmjs/proto-signing": "0.39.0",
+    "@cosmjs/stargate": "0.39.0",
+    "@cosmjs/tendermint-rpc": "0.39.0",
+    "@scure/base": "2.4.0",
+    "@solana/spl-token": "0.4.15",
+    "cosmjs-types": "0.11.0",
+    "tsx": "4.23.15",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "typescript": "5.9.3",
+    "prettier": "3.9.9"
+  }
+}

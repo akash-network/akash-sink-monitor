@@ -1,0 +1,27 @@
+groups:
+  - name: akash-sink-monitor
+    rules:
+      - alert: AkashSinkMonitorUnavailable
+        expr: up{job="akash-sink-monitor"} == 0 or absent(up{job="akash-sink-monitor"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Akash Sink monitor cannot be scraped
+          description: Check the monitoring host. Its own Slack sender may also be down.
+          squad: https://app.squads.so/squads/H2sXJRVW3SnTdFGjTXpGSsVKN2HnDaKc6xLRomS36H3U/transactions?tab=Vault
+      - alert: AkashSinkObservationStale
+        expr: akash_sink_monitor_fresh == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Akash Sink monitor lacks a complete fresh observation
+      - alert: AkashSinkSlackBacklog
+        expr: akash_sink_monitor_outbox_pending > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Akash Sink notifications are not draining
+          description: Verify the Slack webhook, member ID, service --notify flag and delivery logs.

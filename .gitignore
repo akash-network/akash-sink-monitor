@@ -1,0 +1,15 @@
+node_modules/
+.cache/
+.env
+.env.*
+!.env.example
+config.local.json
+state/
+dist/
+*.log
+*-keypair.json
+*.pem
+*.key
+keys/
+*.tgz
+!vendor/chain-sdk.tgz

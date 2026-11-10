@@ -1,0 +1,27 @@
+{
+  "akashRpcs": [
+    "https://rpc.akashnet.net",
+    "https://akash-rpc.polkachu.com",
+    "https://akash-rpc.publicnode.com"
+  ],
+  "solanaRpcs": ["https://api.mainnet-beta.solana.com"],
+  "akashChainId": "akashnet-2",
+  "solanaGenesis": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+  "programId": "98inUHb5mMaHWQZ9ut9PGrnmkMpncLZWWAyFwxCWagME",
+  "lightClientProgramId": "2dTK4NwEkv3gyY5dZnG4TuDYFMoNYQYrBqEGwTSmEmKr",
+  "mint": "5d3fjPDdkYbtYcAMR9PC2TANaEyhzuyP8JxTEwqjVgBZ",
+  "squadsVault": "H2sXJRVW3SnTdFGjTXpGSsVKN2HnDaKc6xLRomS36H3U",
+  "stateDir": "/var/lib/akash-sink-monitor",
+  "slackChannel": "akash-sink-monitor",
+  "intervalSeconds": 15,
+  "pendingWarningSeconds": 300,
+  "pendingCriticalSeconds": 900,
+  "reportLagSeconds": 600,
+  "refundLagSeconds": 600,
+  "capWarningPercent": 80,
+  "capCriticalPercent": 95,
+  "alertRepeatSeconds": 600,
+  "staleSeconds": 120,
+  "listenHost": "127.0.0.1",
+  "listenPort": 9465
+}
