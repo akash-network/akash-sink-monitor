@@ -17,6 +17,7 @@ import {
 } from "./alerts";
 import { serve } from "./http";
 import { scanRejections } from "./rejections";
+import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
 
 const log = (event: string, fields: object = {}) =>
@@ -168,7 +169,7 @@ export async function run(
             snapshot.guardian === config.squadsVault
               ? pauseImport(config)
               : null;
-          updateTransfers(state, snapshot, now);
+          updateTransfers(state, snapshot, now, config);
           state.snapshot = snapshot;
           const alerts = evaluate(snapshot, config);
           try {
@@ -191,7 +192,9 @@ export async function run(
                   event.detail
                     .replaceAll("&", "&amp;")
                     .replaceAll("<", "&lt;")
-                    .replaceAll(">", "&gt;"),
+                    .replaceAll(">", "&gt;") +
+                  "\n" +
+                  akashTxLink(event.txHash, config),
               });
             }
             if (rejected.height < snapshot.akashHeight)

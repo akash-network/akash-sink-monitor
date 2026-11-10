@@ -4,7 +4,7 @@ Application code is published separately in the public `akash-network/akash-sink
 
 ## Completed checks
 
-- `npm run verify`: SDK/IDL checksum verification, absence of the vulnerable native bigint-buffer binding, strict TypeScript compilation, **23 passing tests**, and Prettier checks.
+- `npm run verify`: SDK/IDL checksum verification, absence of the vulnerable native bigint-buffer binding, strict TypeScript compilation, **30 passing tests**, and Prettier checks.
 - Tests exercise accounting deficits, legitimate pending balances, independent burn reconciliation, refund contradictions/deadlines, reporter lag, large integer caps, frozen clients, changed guardians, Slack mentions and cooldowns, failed-delivery restart, recurrence before recovery delivery, observation outages/watchdog, rejected committed deposits, HTTP readiness/read-only endpoints, Squad URLs and the exact unsigned pause instruction.
 - The pause import was decoded back into one `guardian_pause` instruction. Program ID, account order, signer/writable flags, independent discriminator hash and empty signatures were asserted. No simulation or signing was performed.
 - Read-only **standalone** mainnet observation at `2026-11-10T04:29:41Z`: Akash height `29450626`, finalized Solana slot `467586295`; 13 AKT deposited/escrow/proven minted/supply, zero pending, zero refunds, zero burns, no active accounting alerts. Four historical transfers were baselined. Notifications were disabled.
@@ -13,6 +13,14 @@ Application code is published separately in the public `akash-network/akash-sink
 - Scoped source-pattern scan found no private-key PEM, actual Slack webhook/token, AWS access key or 64-byte numeric keypair array in publishable source. No private wallet files were read or copied. This is a scoped check, not a claim about every repository or all possible secret formats. The SDK archive was reproduced from public source rather than accepted as opaque local content.
 
 The final source checksums and local scan evidence are retained under the ignored `.cache/review/` directory. Earlier pre-extraction tests are not counted as validation of the standalone repository.
+
+## Transaction-link update
+
+- Receipt tests bind Akash signed deposit bytes and response IDs to the immutable transfer fields; Solana receipts must match the program, status PDA, instruction and outcome slot. Tests reject unrelated/failed receipts, exercise missing-history follow-ups, restore older state files, recover persisted burn receipts, and check link formatting.
+- Read-only mainnet checks at `2026-11-10T05:46:21Z` and `2026-11-10T05:47:03Z` reconciled all four transfers and 13 AKT, with no accounting alerts. The first pass found all four Akash deposit receipts and three Solana receipts; the next pass recovered the remaining Solana receipt and queued its follow-up link. Slack delivery stayed disabled.
+- Opened the linked 1 AKT deposit in Mintscan and its mint in Solana Explorer; verified the matching destination, amount, success and finalized Solana status. Explorer redirects were checked and the canonical `/akash/tx/` and `/akash/block/` routes are used.
+- Gitleaks scans of published Git history and the final publishable files found no secrets. Local config and state remain ignored.
+- The receipt decoder follows `contracts/solana/local/team-receipt.ts` at node commit `4373aa9206deedc34abca3fe2574ea4ad9b1506d`: bind signed inputs and response identity before attaching a transaction hash. No node files or runtime were changed.
 
 ## Not yet verified
 

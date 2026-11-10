@@ -37,7 +37,8 @@ export async function scanRejections(
   targetHeight: number,
 ) {
   const akash = new AkashClient(rpc, config.akashChainId, config.staleSeconds);
-  const events: { id: string; at: string; detail: string }[] = [];
+  const events: { id: string; at: string; detail: string; txHash: string }[] =
+    [];
   try {
     if (fromHeight === 0) return { height: targetHeight, events };
     const end = Math.min(targetHeight, fromHeight + 200);
@@ -56,6 +57,7 @@ export async function scanRejections(
         for (const rejection of rejectedDeposits(tx, results.results[index])) {
           events.push({
             id: "rejection-" + rejection.hash,
+            txHash: rejection.hash,
             at: block.block.header.time.toISOString(),
             detail: `Akash deposit rejected in block ${height}; tx ${rejection.hash}; sender ${rejection.sender}; recipient ${rejection.recipient}; ${rejection.amount} uakt; ${rejection.codespace}/${rejection.code}. No bridge deposit was created by this failed transaction.`,
           });

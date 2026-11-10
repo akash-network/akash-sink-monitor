@@ -4,8 +4,13 @@ import { z } from "zod";
 import mainnet from "./mainnet.example.json";
 import { web3 } from "@coral-xyz/anchor";
 import { base58 } from "@scure/base";
-import { TxBody, TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
-import { MsgSink } from "@akashnetwork/chain-sdk/private-types/akash.v1";
+import { TxBody, TxRaw, AuthInfo } from "cosmjs-types/cosmos/tx/v1beta1/tx";
+import { TxMsgData } from "cosmjs-types/cosmos/base/abci/v1beta1/abci";
+import {
+  MsgSink,
+  MsgSinkResponse,
+  DestType,
+} from "@akashnetwork/chain-sdk/private-types/akash.v1";
 import { configSchema, slackWebhook } from "./config";
 import {
   monitorStateSchema,
@@ -13,6 +18,7 @@ import {
   type Snapshot,
   type Transfer,
   type Alert,
+  snapshotSchema,
 } from "./model";
 import { evaluate } from "./policy";
 import {
@@ -28,6 +34,13 @@ import { rejectedDeposits } from "./rejections";
 import { metrics, serve } from "./http";
 import { once } from "node:events";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
+import { depositReceipt, isResolutionReceipt, burnReceipts } from "./receipts";
+import { akashTxLink, solanaTxLink, transferLinks } from "./links";
+import { parseSinkId } from "../vendor/id";
+import { statusAddress } from "../vendor/proof";
+import idl from "../idl/akt.json";
+import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 const config = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
@@ -61,6 +74,7 @@ function snapshot(): Snapshot {
     },
     caps: [],
     transfers: [],
+    burns: [],
   };
 }
 function transfer(): Transfer {
@@ -79,6 +93,9 @@ function transfer(): Transfer {
     votes: 0,
     quorum: 4,
     vetoReason: "",
+    depositTxHash: null,
+    solanaTxSignature: null,
+    receiptCheckedAt: 0,
   };
 }
 function state(): MonitorState {
@@ -281,15 +298,15 @@ test("baseline does not announce old transfers; new transitions are durable and 
   const s = state(),
     initial = snapshot();
   initial.transfers = [transfer()];
-  updateTransfers(s, initial, 1000);
+  updateTransfers(s, initial, 1000, config);
   assert.equal(s.events.length, 0);
   s.snapshot = initial;
   const next = structuredClone(initial);
   next.transfers[0].solana = "minted";
-  updateTransfers(s, next, 2000);
+  updateTransfers(s, next, 2000, config);
   assert.equal(s.events.length, 1);
   s.snapshot = next;
-  updateTransfers(s, next, 3000);
+  updateTransfers(s, next, 3000, config);
   assert.equal(s.events.length, 1);
 });
 test("failed committed deposits can be found without transaction event indexes", () => {
@@ -464,5 +481,273 @@ test("HTTP dashboard serves pause import and links, rejects writes, and marks st
   } finally {
     server.close();
     await once(server, "close");
+  }
+});
+
+const receiptOwner = "akash1uwqjtgjhjctjc45ugy7ev5prprhehc7w5xcfwl";
+const receiptSignature = base58.encode(new Uint8Array(64).fill(1));
+function receiptTransfer(): Transfer {
+  return {
+    ...transfer(),
+    id: `${receiptOwner}/100/1`,
+    owner: receiptOwner,
+  };
+}
+function depositFixture(sequence = 1n) {
+  const row = receiptTransfer();
+  const message = MsgSink.fromPartial({
+    sender: row.owner,
+    dest: row.recipient,
+    destType: DestType.DEST_TYPE_SOLANA,
+    amount: { denom: "uakt", amount: row.amountUakt },
+  });
+  const bytes = TxRaw.encode(
+    TxRaw.fromPartial({
+      bodyBytes: TxBody.encode(
+        TxBody.fromPartial({
+          messages: [
+            {
+              typeUrl: "/akash.sink.v1.MsgSink",
+              value: MsgSink.encode(message).finish(),
+            },
+          ],
+        }),
+      ).finish(),
+      authInfoBytes: AuthInfo.encode(AuthInfo.fromPartial({})).finish(),
+    }),
+  ).finish();
+  const data = TxMsgData.encode(
+    TxMsgData.fromPartial({
+      msgResponses: [
+        {
+          typeUrl: "/akash.sink.v1.MsgSinkResponse",
+          value: MsgSinkResponse.encode(
+            MsgSinkResponse.fromPartial({
+              id: { owner: row.owner, height: 100n, sequence },
+            }),
+          ).finish(),
+        },
+      ],
+    }),
+  ).finish();
+  return { bytes, result: { code: 0, data } };
+}
+
+test("deposit links bind raw transaction, response ID and every immutable field", () => {
+  const { bytes, result } = depositFixture();
+  const hash = createHash("sha256").update(bytes).digest("hex").toUpperCase();
+  const row = receiptTransfer();
+  assert.equal(depositReceipt(bytes, result, row), hash);
+  assert.equal(depositReceipt(bytes, { ...result, code: 5 }, row), null);
+  assert.equal(depositReceipt(bytes, depositFixture(2n).result, row), null);
+  for (const wrong of [
+    { ...row, amountUakt: "2" },
+    { ...row, recipient: config.mint },
+    { ...row, owner: "another" },
+    { ...row, id: `${receiptOwner}/101/1` },
+  ])
+    assert.equal(depositReceipt(bytes, result, wrong), null);
+  assert.equal(
+    depositReceipt(bytes, { code: 0, data: new Uint8Array() }, row),
+    null,
+  );
+  assert.equal(depositReceipt(new Uint8Array(), result, row), null);
+  assert.match(akashTxLink(hash, config), new RegExp(`/akash/tx/${hash}`));
+});
+
+function resolutionFixture(
+  name: "mint_transfer" | "void_transfer",
+): web3.ParsedTransactionWithMeta {
+  const definition = idl.instructions.find(
+    (instruction) => instruction.name === name,
+  );
+  assert(definition);
+  const row = receiptTransfer();
+  return {
+    slot: 1100,
+    meta: { err: null, fee: 5000, preBalances: [], postBalances: [] },
+    transaction: {
+      signatures: [receiptSignature],
+      message: {
+        accountKeys: [],
+        recentBlockhash: web3.PublicKey.default.toBase58(),
+        instructions: [
+          {
+            programId: new web3.PublicKey(config.programId),
+            accounts: definition.accounts.map((account) =>
+              account.name === "status"
+                ? statusAddress(
+                    new web3.PublicKey(config.programId),
+                    parseSinkId(row.id),
+                  )
+                : web3.PublicKey.default,
+            ),
+            data: base58.encode(new Uint8Array(definition.discriminator)),
+          },
+        ],
+      },
+    },
+  };
+}
+
+test("Solana links require the correct program, status PDA, instruction and finalized outcome slot", () => {
+  const row: Transfer = {
+    ...receiptTransfer(),
+    solana: "minted",
+    resolvedAtSlot: "1100",
+  };
+  const tx = resolutionFixture("mint_transfer");
+  assert(isResolutionReceipt(tx, row, config.programId));
+  assert(!isResolutionReceipt(tx, row, config.lightClientProgramId));
+  assert(
+    !isResolutionReceipt(
+      tx,
+      { ...row, id: `${receiptOwner}/100/2` },
+      config.programId,
+    ),
+  );
+  assert(
+    !isResolutionReceipt(
+      tx,
+      { ...row, resolvedAtSlot: "1101" },
+      config.programId,
+    ),
+  );
+  assert(!isResolutionReceipt({ ...tx, meta: null }, row, config.programId));
+  assert(
+    !isResolutionReceipt(
+      {
+        ...tx,
+        meta: {
+          ...tx.meta,
+          err: "failed",
+          fee: 0,
+          preBalances: [],
+          postBalances: [],
+        },
+      },
+      row,
+      config.programId,
+    ),
+  );
+  const voidTx = resolutionFixture("void_transfer");
+  assert(!isResolutionReceipt(voidTx, row, config.programId));
+  assert(
+    isResolutionReceipt(voidTx, { ...row, solana: "voided" }, config.programId),
+  );
+  assert(
+    isResolutionReceipt(tx, { ...row, solana: "voided" }, config.programId),
+  );
+});
+
+test("receipt links arrive after an unavailable lookup, persist and do not repeat", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const next = snapshot();
+  next.transfers = [receiptTransfer()];
+  updateTransfers(s, next, 1, config);
+  assert.match(s.outbox[0].text, /lookup unavailable/);
+  s.snapshot = next;
+  s.outbox = [];
+  const linked = structuredClone(next);
+  linked.transfers[0].depositTxHash = "A".repeat(64);
+  linked.transfers[0].solana = "minted";
+  linked.transfers[0].resolvedAtSlot = "1100";
+  linked.transfers[0].solanaTxSignature = receiptSignature;
+  updateTransfers(s, linked, 2, config);
+  const message = s.outbox[0].text;
+  assert(message.includes(akashTxLink("A".repeat(64), config)));
+  assert(message.includes(solanaTxLink(receiptSignature, config)));
+  s.snapshot = linked;
+  const restored = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  updateTransfers(restored, linked, 3, config);
+  assert.equal(restored.outbox.length, 1);
+  const incident: Alert = { ...critical, transferId: linked.transfers[0].id };
+  assert(
+    alertText(incident, config, restored).includes(
+      solanaTxLink(receiptSignature, config),
+    ),
+  );
+  const refunded = { ...linked.transfers[0], akash: "STATUS_REFUNDED" };
+  assert.match(transferLinks(refunded, config), /not a refund transaction/);
+});
+
+test("delayed receipt without a status change gets one follow-up notice", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  s.snapshot.transfers = [receiptTransfer()];
+  const next = structuredClone(s.snapshot);
+  next.transfers[0].depositTxHash = "B".repeat(64);
+  updateTransfers(s, next, 1, config);
+  assert.match(s.outbox[0].text, /transaction links available/);
+  s.snapshot = next;
+  updateTransfers(s, next, 2, config);
+  assert.equal(s.outbox.length, 1);
+});
+
+test("old persisted snapshots migrate without discarding accounting or inventing receipts", () => {
+  const { burns, ...oldSnapshot } = snapshot();
+  const { depositTxHash, solanaTxSignature, receiptCheckedAt, ...oldTransfer } =
+    receiptTransfer();
+  const restored = snapshotSchema.parse({
+    ...oldSnapshot,
+    transfers: [oldTransfer],
+  });
+  assert.equal(restored.transfers[0].depositTxHash, null);
+  assert.equal(restored.transfers[0].solanaTxSignature, null);
+  assert.deepEqual(restored.burns, []);
+  assert.equal(restored.lockedUakt, oldSnapshot.lockedUakt);
+});
+
+test("explorer links reject malformed identifiers and never mislabel another chain as mainnet", () => {
+  assert.throws(() => akashTxLink("<@everyone>", config));
+  assert.throws(() => solanaTxLink("invalid", config));
+  assert(
+    !akashTxLink("A".repeat(64), {
+      ...config,
+      akashChainId: "testnet",
+    }).includes("https://"),
+  );
+  assert(
+    !solanaTxLink(receiptSignature, {
+      ...config,
+      solanaGenesis: "testnet",
+    }).includes("https://"),
+  );
+});
+
+test("burn links recover from persisted receipts even after the index advanced before a restart", async () => {
+  await mkdir(".cache", { recursive: true });
+  const directory = await mkdtemp(".cache/burn-receipts-");
+  try {
+    await mkdir(join(directory, "burn-events"));
+    const burn = { signature: receiptSignature, slot: 1100, amount: "1000000" };
+    await writeFile(
+      join(directory, "burn-events", receiptSignature + ".json"),
+      JSON.stringify(burn),
+    );
+    const previous = snapshot();
+    const receipts = await burnReceipts(directory, previous, "1000000", 1200);
+    assert.deepEqual(receipts, [burn]);
+    const s = state();
+    s.snapshot = previous;
+    const next = {
+      ...snapshot(),
+      burnedUakt: "1000000",
+      burns: receipts,
+      solanaSlot: 1200,
+    };
+    updateTransfers(s, next, 1, config);
+    assert(s.outbox[0].text.includes(solanaTxLink(receiptSignature, config)));
+    assert.equal(
+      (await burnReceipts(directory, next, "1000000", 1200)).length,
+      0,
+    );
+    const missing = state();
+    missing.snapshot = previous;
+    updateTransfers(missing, { ...next, burns: [] }, 2, config);
+    assert.match(missing.outbox[0].text, /receipt coverage incomplete/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

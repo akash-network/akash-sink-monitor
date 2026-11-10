@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { web3 } from "@coral-xyz/anchor";
 import { z } from "zod";
-const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+export const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
 const address = z.string().refine((value) => {
   try {

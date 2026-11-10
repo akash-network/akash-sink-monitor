@@ -16,7 +16,13 @@ import { pda, LE64 } from "../vendor/common";
 import { clientStatus } from "../vendor/client-status";
 import { reconcileConfigured } from "../vendor/reconcile";
 import type { Config } from "./config";
-import { snapshotSchema, type Snapshot, type Cap } from "./model";
+import {
+  snapshotSchema,
+  type Snapshot,
+  type Cap,
+  type Transfer,
+} from "./model";
+import { burnReceipts, enrichReceipts } from "./receipts";
 
 export async function collectSnapshot(
   config: Config,
@@ -166,7 +172,7 @@ export async function collectSnapshot(
     const previousById = new Map(
       previous?.transfers.map((row) => [row.id, row]),
     );
-    const transfers = [];
+    const transfers: Transfer[] = [];
     let deposited = 0n,
       largestPending = 0n;
     for (const [index, entry] of result.records.entries()) {
@@ -208,6 +214,9 @@ export async function collectSnapshot(
           transfer.settlement.policy.members.length,
         ),
         vetoReason: transfer.settlement.vetoReason,
+        depositTxHash: old?.depositTxHash ?? null,
+        solanaTxSignature: old?.solanaTxSignature ?? null,
+        receiptCheckedAt: old?.receiptCheckedAt ?? 0,
       });
     }
     caps.push(
@@ -225,6 +234,13 @@ export async function collectSnapshot(
         limitUakt: bridge.policy.perTransferMax.toString(),
         period: "Per transfer; not a cumulative quota",
       },
+    );
+    await enrichReceipts(transfers, config, akashRpc, connection.rpcEndpoint);
+    const burns = await burnReceipts(
+      config.stateDir,
+      previous,
+      report.cumulativeBurnedUakt,
+      report.solanaSlot,
     );
     assert(
       Date.now() / 1000 - Number(state.time) <= config.staleSeconds,
@@ -271,6 +287,7 @@ export async function collectSnapshot(
       },
       caps,
       transfers,
+      burns,
     });
   } finally {
     akash.close();

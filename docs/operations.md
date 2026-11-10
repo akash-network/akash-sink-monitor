@@ -19,6 +19,14 @@ The initial index can need substantial RPC history. Do not delete `burn-index.js
 
 Writes use mode 0600, adjacent temporary files, fsync and atomic rename. These temporary files must be adjacent to durable state so replacement stays on the same filesystem; they are not build scratch files. Local development scratch lives in the repository's ignored `.cache/`.
 
+## Transaction links in alerts
+
+Transfer notifications and transfer-specific incidents link the original Akash deposit and finalized Solana mint/void transaction. Deposit links bind the signed message and response ID to the reconciled transfer; Solana links bind the program, status account, instruction and resolution slot. Rejected deposits link the failed committed transaction, and burn notices link the independently indexed burn transaction.
+
+Missing history never produces an invented transaction link. The monitor retries receipt lookups with a bounded per-poll budget and sends a follow-up when a link becomes available. Refund notices link the original deposit and void evidence and label the observation block separately: a refund may run automatically in a block without its own transaction. Aggregate accounting/cap alerts identify their observation blocks rather than claiming a single transaction caused the condition.
+
+Receipt lookup does not replace accounting verification. RPC history unavailable for reconciliation remains an observation failure. The service observes committed/finalized activity, so there is normal chain-finality and polling delay.
+
 ## Critical alert: pause Solana issuance
 
 1. Open the alert's Squad link with a member wallet. Copy its base58 payload or use **Copy base58 pause transaction** in the dashboard.
@@ -53,3 +61,15 @@ Use an independent Prometheus/Alertmanager installation to alert on a missing/do
 Critical monitor alerts include pause bytes. External process-down alerts link the Squad but cannot independently certify a current guardian or produce a newly verified payload; preserve the last known import in your incident notes. Backing checks use exact integer arithmetic. Prometheus samples use floating point, so use the JSON snapshot for exact audit amounts.
 
 Inspect structured service logs for `snapshot-attempt-failed`, `observation-unavailable` and `slack-delivery-failed`. RPC failures are labelled by endpoint index and redact URLs. A 429 is an observation/delivery problem, not evidence of lost funds. Do not use public shared RPC endpoints as your only production data source.
+
+## Coverage and limits
+
+- Collection uses committed Akash state and finalized Solana observations, not mempool events. Committed rejections are indexed from the first successful observation onward; pre-start rejections are not backfilled.
+- CheckTx/mempool rejections and relayer transactions that never reach chain need operator logs. This monitor does not claim to see them. Failed Solana submissions leave a pending transfer and are detected through its settlement timer.
+- The initial burn index must reach mint creation. Subsequent scans must cover the saved finalized slot. Use a Solana RPC retaining transaction history and Akash RPCs retaining required block/results and query heights. Missing coverage fails closed.
+- This version fully reconciles retained transfer history each pass. It is intended for current launch traffic; it has not been load-tested for large lifetime histories. The burn scan is bounded to 10,000 transactions per pass and becomes unavailable if exceeded. Preserve state and monitor collection latency; do not hide this condition by deleting the index or raising limits blindly.
+- RPC fallback is availability protection, not independent cryptographic verification of both chains or multi-provider consensus. The monitor trusts its configured RPCs. Existing contract light-client validation is unchanged.
+- The default listener is loopback. Use a VPN or authenticated HTTPS reverse proxy before exposing the dashboard. An external watchdog is required to alert if this host dies or Slack delivery fails.
+
+
+This bridge is one-way: Solana issuance and Akash refunds are bridge outflows; wallet-to-wallet SPL transfers are not. Burns reduce supply and do not redeem native AKT.

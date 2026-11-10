@@ -1,11 +1,26 @@
 import { z } from "zod";
+import { base58 } from "@scure/base";
 
 export const uint = z.string().regex(/^(0|[1-9][0-9]*)$/);
+export const txHashSchema = z.string().regex(/^[A-F0-9]{64}$/);
+export const signatureSchema = z.string().refine((value) => {
+  try {
+    return base58.decode(value).length === 64;
+  } catch {
+    return false;
+  }
+}, "Expected a Solana transaction signature");
+export const burnSchema = z.object({
+  signature: signatureSchema,
+  slot: z.number().int().positive(),
+  amount: uint,
+});
 export const alertSchema = z.object({
   key: z.string(),
   severity: z.enum(["warning", "critical"]),
   title: z.string(),
   detail: z.string(),
+  transferId: z.string().optional(),
 });
 export type Alert = z.infer<typeof alertSchema>;
 
@@ -24,6 +39,9 @@ export const transferSchema = z.object({
   votes: z.number().int().nonnegative(),
   quorum: z.number().int().nonnegative(),
   vetoReason: z.string(),
+  depositTxHash: txHashSchema.nullable().default(null),
+  solanaTxSignature: signatureSchema.nullable().default(null),
+  receiptCheckedAt: z.number().int().nonnegative().default(0),
 });
 export const capSchema = z.object({
   key: z.string(),
@@ -62,6 +80,7 @@ export const snapshotSchema = z.object({
   nativeGuardian: z.string(),
   caps: z.array(capSchema),
   transfers: z.array(transferSchema),
+  burns: z.array(burnSchema).default([]),
 });
 export type Snapshot = z.infer<typeof snapshotSchema>;
 export type Transfer = z.infer<typeof transferSchema>;

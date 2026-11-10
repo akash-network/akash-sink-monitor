@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 import type { Config } from "./config";
 import { akt, type Alert, type MonitorState, type Snapshot } from "./model";
 import { squadsUrl, pausePanelUrl } from "./pause";
+import { observationLinks, solanaTxLink, transferLinks } from "./links";
+
+function evidence(alert: Alert, config: Config, state: MonitorState): string {
+  const snapshot = state.snapshot;
+  if (!snapshot) return "";
+  const transfer = snapshot.transfers.find(
+    (row) => row.id === alert.transferId,
+  );
+  return `\n${transfer ? transferLinks(transfer, config) + "\n" : ""}${observationLinks(snapshot, config)}`;
+}
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const escape = (text: string) =>
@@ -23,7 +33,7 @@ export function alertText(
       : state.pauseImport === null
         ? "\nSquads pause import unavailable: verify the configured guardian and chain identity."
         : `\n*Emergency action: pause new Solana mints*${links}\nNew transaction → Add instruction → Import base58 encoded tx. Vault: ${config.squadsVault}. Requires your Squad's approvals.\n\`\`\`${state.pauseImport}\`\`\`\nUnsigned instruction import only; no automatic execution. This does NOT pause Akash deposits/refunds. Use the separate Akash guardian response in the runbook. Snapshot: ${state.snapshot?.checkedAt ?? "unavailable"}.`;
-  return `${mention}*${alert.severity.toUpperCase()}: ${escape(alert.title)}*\n${escape(alert.detail)}${pause}`;
+  return `${mention}*${alert.severity.toUpperCase()}: ${escape(alert.title)}*\n${escape(alert.detail)}${evidence(alert, config, state)}${pause}`;
 }
 
 export function queueMessage(
@@ -65,7 +75,7 @@ export function updateAlerts(
         key: "alert:" + key,
         fingerprint: "resolved",
         now,
-        text: `*RESOLVED: ${escape(previous.title)}*\nCondition cleared in a complete fresh snapshot.`,
+        text: `*RESOLVED: ${escape(previous.title)}*\nCondition cleared in a complete fresh snapshot.${evidence(previous, config, state)}`,
       });
     }
   }
@@ -98,6 +108,7 @@ export function updateTransfers(
   state: MonitorState,
   next: Snapshot,
   now: number,
+  config: Config,
 ) {
   const previous = state.snapshot;
   if (!previous) {
@@ -128,9 +139,15 @@ export function updateTransfers(
         prior.challengeEnd,
         prior.vetoReason,
       ].join(":");
-    if (fingerprint === oldFingerprint) continue;
+    const receiptsChanged =
+      prior &&
+      (row.depositTxHash !== prior.depositTxHash ||
+        row.solanaTxSignature !== prior.solanaTxSignature);
+    if (fingerprint === oldFingerprint && !receiptsChanged) continue;
     const detail = `${row.id}: ${akt(row.amountUakt)} AKT → ${row.recipient}; Akash ${row.akash}; Solana ${row.solana}; ${row.hold}; refund challenge ends ${row.challengeEnd}.`;
-    const id = hash(row.id + ":" + fingerprint);
+    const id = hash(
+      [row.id, fingerprint, row.depositTxHash, row.solanaTxSignature].join(":"),
+    );
     if (!state.events.some((entry) => entry.id === id)) {
       state.events.push({ id, at: next.checkedAt, detail });
     }
@@ -138,19 +155,30 @@ export function updateTransfers(
       key: "transfer:" + id,
       fingerprint,
       now,
-      text: `*Bridge transfer ${prior ? "updated" : "deposited"}*\n${escape(detail)}`,
+      text: `*Bridge transfer ${fingerprint === oldFingerprint ? "transaction links available" : prior ? "updated" : "deposited"}*\n${escape(detail)}\n${transferLinks(row, config)}\n${observationLinks(next, config)}`,
     });
   }
   if (BigInt(next.burnedUakt) > BigInt(previous.burnedUakt)) {
     const delta = (
       BigInt(next.burnedUakt) - BigInt(previous.burnedUakt)
     ).toString();
-    queueMessage(state, {
-      key: "burn:" + next.burnedUakt,
-      fingerprint: next.burnedUakt,
-      now,
-      text: `*Solana AKT burned*\n${akt(delta)} AKT burned. This is a supply reduction, not a bridge redemption or Akash refund.`,
-    });
+    let linked = 0n;
+    for (const burn of next.burns) {
+      linked += BigInt(burn.amount);
+      queueMessage(state, {
+        key: "burn:" + burn.signature,
+        fingerprint: burn.signature,
+        now,
+        text: `*Solana AKT burned*\n${akt(burn.amount)} AKT burned. This is a supply reduction, not a bridge redemption or Akash refund.\n${solanaTxLink(burn.signature, config)}`,
+      });
+    }
+    if (linked !== BigInt(delta))
+      queueMessage(state, {
+        key: "burn:" + next.burnedUakt,
+        fingerprint: next.burnedUakt,
+        now,
+        text: `*Solana AKT burn receipt coverage incomplete*\nTotal increase ${akt(delta)} AKT; transaction receipts available for ${akt(linked.toString())} AKT. Inspect the persistent burn index. Burns are not bridge redemptions or Akash refunds.\n${observationLinks(next, config)}`,
+      });
   }
 }
 

@@ -8,7 +8,8 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
     severity: Alert["severity"],
     title: string,
     detail: string,
-  ) => alerts.push({ key, severity, title, detail });
+    transferId?: string,
+  ) => alerts.push({ key, severity, title, detail, transferId });
   const escrowGap =
     BigInt(snapshot.lockedUakt) - BigInt(snapshot.accountedEscrowUakt);
   if (escrowGap !== 0n)
@@ -110,6 +111,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "critical",
         "Contradictory cross-chain settlement",
         `${transfer.id}: Akash ${transfer.akash}, Solana ${transfer.solana}; ${transfer.amountUakt} uakt.`,
+        transfer.id,
       );
     if (transfer.hold !== "HOLD_NONE")
       add(
@@ -117,6 +119,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "critical",
         "Transfer requires governance review",
         `${transfer.id}: ${transfer.hold}; ${transfer.vetoReason}`,
+        transfer.id,
       );
     const pending = ["STATUS_TRANSFER_PENDING", "STATUS_VOIDED"].includes(
       transfer.akash,
@@ -132,6 +135,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         age >= config.pendingCriticalSeconds ? "critical" : "warning",
         "Transfer remains unresolved",
         `${transfer.id}: pending ${age} seconds; ${transfer.amountUakt} uakt; no finalized Solana result.`,
+        transfer.id,
       );
     }
     if (
@@ -146,6 +150,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "critical",
         "Reporters have not settled a finalized outcome",
         `${transfer.id}: Solana ${transfer.solana}; Akash ${transfer.akash}; votes ${transfer.votes}/${transfer.quorum}.`,
+        transfer.id,
       );
     }
     if (
@@ -159,6 +164,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
         "critical",
         "Refund overdue after challenge window",
         `${transfer.id}; check refunds enabled, FIFO queue, epoch capacity and reporter delivery. Refunds enabled: ${snapshot.refundsEnabled}.`,
+        transfer.id,
       );
     }
   }
