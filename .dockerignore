@@ -1,0 +1,13 @@
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/*.ts
+src/*.test.ts
+!vendor/
+!vendor/*.ts
+!vendor/chain-sdk.tgz
+!idl/
+!idl/*.json
+!idl/*.ts

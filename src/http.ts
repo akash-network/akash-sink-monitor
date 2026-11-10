@@ -44,14 +44,29 @@ refresh();setInterval(refresh,5000);
 
 export function metrics(state: MonitorState, fresh: boolean): string {
   const lines = [
+    "# HELP akash_sink_monitor_fresh Whether the latest complete observation is within the configured freshness window.",
     "# TYPE akash_sink_monitor_fresh gauge",
     `akash_sink_monitor_fresh ${Number(fresh)}`,
+    "# HELP akash_sink_monitor_last_success_seconds Unix timestamp of the latest complete observation, or zero before the first success.",
+    "# TYPE akash_sink_monitor_last_success_seconds gauge",
     `akash_sink_monitor_last_success_seconds ${state.snapshot ? Date.parse(state.snapshot.checkedAt) / 1000 : 0}`,
+    "# HELP akash_sink_monitor_outbox_pending Number of notifications awaiting successful delivery.",
+    "# TYPE akash_sink_monitor_outbox_pending gauge",
     `akash_sink_monitor_outbox_pending ${state.outbox.length}`,
+    "# HELP akash_sink_monitor_critical_alerts Number of active critical alerts.",
+    "# TYPE akash_sink_monitor_critical_alerts gauge",
     `akash_sink_monitor_critical_alerts ${Object.values(state.active).filter((a) => a.severity === "critical").length}`,
   ];
   const s = state.snapshot;
   if (s) {
+    lines.push(
+      "# HELP akash_sink_amount_uakt Bridge accounting amounts in micro-AKT from the latest complete observation.",
+      "# TYPE akash_sink_amount_uakt gauge",
+      "# HELP akash_sink_cap_used_uakt Usage of each bridge cap in micro-AKT.",
+      "# TYPE akash_sink_cap_used_uakt gauge",
+      "# HELP akash_sink_cap_limit_uakt Limit of each bridge cap in micro-AKT.",
+      "# TYPE akash_sink_cap_limit_uakt gauge",
+    );
     for (const [label, value] of Object.entries({
       locked: s.lockedUakt,
       deposited: s.depositedUakt,
