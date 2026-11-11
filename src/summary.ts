@@ -3,6 +3,10 @@ import type { MonitorState } from "./model";
 import { queueMessage } from "./alerts";
 import { reporterHealth } from "./reporters";
 import {
+  accountLimitDetail,
+  accountLimitsNearCapacity,
+} from "./account-limits";
+import {
   formatAkt,
   formatDuration as duration,
   slackEscape,
@@ -105,6 +109,15 @@ export function summaryText(
                 `${slackEscape(cap.label)}: ${formatAkt(cap.usedUakt)} / ${formatAkt(cap.limitUakt)} AKT`,
             )
             .join("\n"),
+      );
+    const accounts = accountLimitsNearCapacity(s, config);
+    if (accounts.length)
+      sections.push(
+        "*Account limits*\n" +
+          accounts.slice(0, 5).map(accountLimitDetail).join("\n\n") +
+          (accounts.length > 5
+            ? `\nPlus ${accounts.length - 5} more accounts near their limit.`
+            : ""),
       );
   }
   if (s && !fresh)

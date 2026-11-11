@@ -45,6 +45,7 @@ export function evaluate(snapshot: Snapshot, config: Config): Alert[] {
       `Recorded mints and Solana supply plus burns differ by ${formatAkt(backingGap.toString())} AKT.`,
     );
   for (const cap of snapshot.caps) {
+    if (cap.key.startsWith("account:")) continue;
     const used = BigInt(cap.usedUakt),
       limit = BigInt(cap.limitUakt);
     if (limit === 0n) {

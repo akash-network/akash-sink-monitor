@@ -46,6 +46,7 @@ import { recordReports, reporterHealth } from "./reporters";
 import { queueSummary, summaryText } from "./summary";
 import { Script } from "node:vm";
 import { formatAkt } from "./format";
+import { updateAccountLimitNotices } from "./account-limits";
 
 const config = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
@@ -201,6 +202,141 @@ test("caps use exact integers beyond JavaScript safe number range", () => {
   assert.equal(evaluate(s, config)[0].severity, "critical");
   s.caps[0].usedUakt = "0";
   assert.deepEqual(evaluate(s, config), []);
+});
+test("account limits notify once per native epoch, including across restarts", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  s.snapshot.caps = [
+    {
+      key: "account:akash1sender",
+      label: "Account akash1sender",
+      period: "Native Akash day epoch 42",
+      usedUakt: "790000",
+      limitUakt: "1000000",
+    },
+  ];
+  updateAccountLimitNotices(s, config, now);
+  assert.equal(s.outbox.length, 0);
+  s.snapshot.caps[0].usedUakt = "800000";
+  updateAccountLimitNotices(s, config, now);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /ℹ️ Account deposit limit nearing capacity/);
+  assert(!s.outbox[0].text.includes("<@"));
+  await deliverOutbox({
+    state: s,
+    webhook: "https://hooks.slack.com/services/TEST",
+    post: async () => new Response("ok"),
+    persist: async () => {},
+    now: () => now,
+  });
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  assert(s.snapshot);
+  const later = now + 3 * 3600_000;
+  s.snapshot.checkedAt = new Date(later).toISOString();
+  for (const used of ["950000", "1000000", "0", "800000"]) {
+    s.snapshot.caps[0].usedUakt = used;
+    s.active = Object.fromEntries(
+      evaluate(s.snapshot, config).map((a) => [a.key, a]),
+    );
+    updateAccountLimitNotices(s, config, later);
+    assert.equal(s.outbox.length, 0);
+    assert.deepEqual(s.active, {});
+  }
+  const summary = summaryText(s, config, later);
+  assert.match(summary, /🟢 Akash Sink · All clear/);
+  assert.match(summary, /\*Account limits\*/);
+  assert.match(summary, /0.8 \/ 1 AKT used · 0.2 AKT remaining/);
+  assert.match(
+    metrics(s, true, config, later),
+    /akash_sink_monitor_critical_alerts 0/,
+  );
+  s.snapshot.caps[0].period = "Native Akash day epoch 43";
+  updateAccountLimitNotices(s, config, later);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /epoch 43/);
+});
+test("undelivered account notices refresh and disappear when no longer current", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  s.snapshot.caps = [
+    {
+      key: "account:akash1sender",
+      label: "Account akash1sender",
+      period: "Native Akash day epoch 42",
+      usedUakt: "800000",
+      limitUakt: "1000000",
+    },
+  ];
+  updateAccountLimitNotices(s, config, now);
+  const id = s.outbox[0].id;
+  s.snapshot.caps[0].usedUakt = "1000000";
+  updateAccountLimitNotices(s, config, now + 1000);
+  assert.equal(s.outbox[0].id, id);
+  assert.match(s.outbox[0].text, /limit reached/);
+  assert.match(s.outbox[0].text, /0 AKT remaining/);
+  updateAccountLimitNotices(s, config, now + config.staleSeconds * 1000);
+  assert.equal(s.outbox.length, 0);
+  assert(
+    !summaryText(s, config, now + config.staleSeconds * 1000).includes(
+      "*Account limits*",
+    ),
+  );
+  updateAccountLimitNotices(s, config, now);
+  assert.equal(s.outbox.length, 1);
+  s.snapshot.caps[0].usedUakt = "0";
+  s.snapshot.caps[0].period = "Native Akash day epoch 43";
+  updateAccountLimitNotices(s, config, now);
+  assert.equal(s.outbox.length, 0);
+  s.snapshot.caps[0].limitUakt = "0";
+  updateAccountLimitNotices(s, config, now);
+  assert.deepEqual(evaluate(s.snapshot, config), []);
+  assert.match(s.outbox[0].text, /ℹ️ Account deposit limit reached/);
+});
+test("saved account alerts retire quietly while financial incidents stay active", async () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  s.snapshot.caps = [
+    {
+      key: "account:akash1sender",
+      label: "Account akash1sender",
+      period: "Native Akash day epoch 42",
+      usedUakt: "1000000",
+      limitUakt: "1000000",
+    },
+  ];
+  const legacy: Alert = {
+    key: "cap:account:akash1sender",
+    severity: "critical",
+    title: "Account approaching limit",
+    detail: "Used 1 of 1 AKT",
+  };
+  updateAlerts(s, [legacy, critical], config, now);
+  await deliverOutbox({
+    state: s,
+    webhook: "https://hooks.slack.com/services/TEST",
+    post: async () => new Response("ok"),
+    persist: async () => {},
+    now: () => now,
+  });
+  const later = now + config.alertRepeatSeconds * 1000;
+  s.snapshot.checkedAt = new Date(later).toISOString();
+  updateAlerts(s, [legacy, critical], config, later);
+  assert.equal(s.outbox.length, 2);
+  const restored = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  updateAccountLimitNotices(restored, config, later);
+  updateAlerts(restored, [critical], config, later);
+  assert.deepEqual(Object.keys(restored.active), [critical.key]);
+  assert.deepEqual(
+    restored.outbox.map((message) => message.key),
+    ["alert:backing"],
+  );
+  assert.equal(
+    restored.delivered["notice:account:akash1sender"].fingerprint,
+    "Native Akash day epoch 42",
+  );
 });
 test("frozen client and changed guardian are critical", () => {
   const s = snapshot();

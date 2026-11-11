@@ -20,6 +20,7 @@ import { scanTransactions } from "./transactions";
 import { queueSummary } from "./summary";
 import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
+import { updateAccountLimitNotices } from "./account-limits";
 
 const log = (event: string, fields: object = {}) =>
   process.stdout.write(
@@ -118,6 +119,7 @@ export async function run(
       identity,
       "state directory belongs to another deployment",
     );
+    updateAccountLimitNotices(state, config, Date.now());
     const persist = async () => {
       // Audit events are written before advancing the snapshot. Stable IDs
       // make a repeated write after a crash harmless.
@@ -139,6 +141,7 @@ export async function run(
     };
     const watchdog = async () => {
       const now = Date.now();
+      updateAccountLimitNotices(state, config, now);
       observationUnavailable(state, config, now);
       if (options.notify && !options.once) queueSummary(state, config, now);
       await persist();
@@ -246,6 +249,7 @@ export async function run(
             severity: alert?.severity ?? "retrying",
           });
         }
+        updateAccountLimitNotices(state, config, Date.now());
         if (options.notify && !options.once)
           queueSummary(state, config, Date.now());
         await persist();
