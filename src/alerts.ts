@@ -6,11 +6,12 @@ import { solanaTxLink, transferLinks } from "./links";
 import { formatAkt, slackEscape, statusLabel } from "./format";
 
 function evidence(alert: Alert, config: Config, state: MonitorState): string {
+  if (!alert.transferId) return "";
   const transfer = state.snapshot?.transfers.find(
     (row) => row.id === alert.transferId,
   );
   const links = transfer ? transferLinks(transfer, config) : "";
-  return links ? `\n\n${links}` : "";
+  return `\n\n*Transfer ID:* ${slackEscape(alert.transferId)}${links ? `\n\n${links}` : ""}`;
 }
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -40,6 +41,7 @@ function transferText(row: Transfer, config: Config, title: string): string {
   const lines = [
     `*${title}*`,
     "",
+    `*Transfer ID:* ${slackEscape(row.id)}`,
     `*Amount:* ${formatAkt(row.amountUakt)} AKT`,
     `*Status:* ${statusLabel(row.akash)} · Solana ${row.solana}`,
     `*Recipient:* ${slackEscape(row.recipient)}`,
