@@ -21,6 +21,7 @@ import { parseSinkId, sinkIdParts } from "../vendor/id";
 import { statusAddress } from "../vendor/proof";
 import { burnSchema, type Snapshot, type Transfer } from "./model";
 import type { Config } from "./config";
+import { solanaRpcFetch } from "./rpc";
 
 // Bind the signed deposit and its response ID to the reconciled transfer.
 export function depositReceipt(
@@ -171,7 +172,7 @@ export async function enrichReceipts(
     commitment: "finalized",
     disableRetryOnRateLimit: true,
     fetch: (url, options) =>
-      fetch(url, {
+      solanaRpcFetch(url, {
         ...options,
         signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]),
       }),

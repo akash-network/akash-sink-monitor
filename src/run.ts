@@ -21,6 +21,7 @@ import { queueSummary } from "./summary";
 import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
 import { updateAccountLimitNotices } from "./account-limits";
+import { solanaRpcFetch } from "./rpc";
 
 const log = (event: string, fields: object = {}) =>
   process.stdout.write(
@@ -36,8 +37,7 @@ export async function poll(config: Config, state: MonitorState) {
         const connection = new web3.Connection(config.solanaRpcs[s], {
           commitment: "finalized",
           disableRetryOnRateLimit: true,
-          fetch: async (url, init) =>
-            fetch(url, { ...init, signal: AbortSignal.timeout(20_000) }),
+          fetch: solanaRpcFetch,
         });
         const snapshot = await collectSnapshot(
           config,
