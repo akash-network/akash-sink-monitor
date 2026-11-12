@@ -73,21 +73,3 @@ export const configSchema = z
     }
   });
 export type Config = z.infer<typeof configSchema>;
-
-export function slackWebhook(env: NodeJS.ProcessEnv): string | undefined {
-  const value = env.SINK_MONITOR_SLACK_WEBHOOK;
-  if (!value) return undefined;
-  const url = new URL(value);
-  if (
-    url.protocol !== "https:" ||
-    !["hooks.slack.com", "hooks.slack-gov.com"].includes(url.hostname) ||
-    !url.pathname.startsWith("/services/") ||
-    url.username ||
-    url.password
-  ) {
-    throw new Error(
-      "SINK_MONITOR_SLACK_WEBHOOK must be a Slack HTTPS incoming webhook",
-    );
-  }
-  return value;
-}

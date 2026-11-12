@@ -1,9 +1,15 @@
 import { createHash } from "node:crypto";
+import { setTimeout } from "node:timers/promises";
 import type { Config } from "./config";
 import type { Alert, MonitorState, Snapshot, Transfer } from "./model";
 import { squadsUrl, pausePanelUrl } from "./pause";
 import { solanaTxLink, transferLinks } from "./links";
 import { formatAkt, slackEscape, statusLabel } from "./format";
+import {
+  postSlackMessage,
+  SlackDeliveryError,
+  type SlackTarget,
+} from "./slack";
 
 function evidence(alert: Alert, config: Config, state: MonitorState): string {
   if (!alert.transferId) return "";
@@ -66,6 +72,7 @@ export function queueMessage(
     fingerprint: string;
     text: string;
     now: number;
+    transferId?: string;
   },
 ) {
   const { key, fingerprint, text, now } = input;
@@ -74,6 +81,7 @@ export function queueMessage(
   const existing = state.outbox.find((row) => row.key === key);
   if (existing?.fingerprint === fingerprint) {
     existing.text = text;
+    existing.transferId = input.transferId;
     return;
   }
   state.outbox = state.outbox.filter((row) => row.key !== key);
@@ -83,6 +91,7 @@ export function queueMessage(
     fingerprint,
     text,
     createdAt: now,
+    transferId: input.transferId,
   });
 }
 
@@ -174,6 +183,7 @@ export function updateTransfers(
     }
     queueMessage(state, {
       key: "transfer:" + id,
+      transferId: row.id,
       fingerprint,
       now,
       text: transferText(
@@ -213,14 +223,22 @@ export function updateTransfers(
 
 export async function deliverOutbox(input: {
   state: MonitorState;
-  webhook: string;
+  target: SlackTarget;
   persist: () => Promise<void>;
   post?: typeof fetch;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }) {
-  const { state, webhook, persist, post = fetch, now = Date.now } = input;
+  const {
+    state,
+    target,
+    persist,
+    post = fetch,
+    now = Date.now,
+    sleep = setTimeout,
+  } = input;
   // Critical messages lead the queue; a burst of transfer events must not
-  // delay a backing alert. Slack incoming webhooks are at-least-once: a crash
+  // delay a backing alert. Slack delivery is at-least-once: a crash
   // after acceptance but before checkpoint can repeat the stable message ID.
   state.outbox.sort(
     (a, b) =>
@@ -228,19 +246,42 @@ export async function deliverOutbox(input: {
         Number(a.fingerprint === "critical") || a.createdAt - b.createdAt,
   );
   for (const message of state.outbox.slice(0, 10)) {
-    const response = await post(webhook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        text: message.text,
-        unfurl_links: false,
-        unfurl_media: false,
-      }),
-      signal: AbortSignal.timeout(10_000),
+    if (target.kind === "bot") {
+      const wait = state.slackNextPostAt - now();
+      if (wait > 1000) return;
+      if (wait > 0) await sleep(wait);
+    }
+    const parent = message.transferId
+      ? state.slackThreads[message.transferId]
+      : undefined;
+    const threadTs =
+      target.kind === "bot" && parent?.channelId === target.channelId
+        ? parent.ts
+        : undefined;
+    const result = await postSlackMessage({
+      target,
+      text: message.text,
+      threadTs,
+      post,
     });
-    if (!response.ok || (await response.text()).trim() !== "ok") {
-      // Do not include the webhook URL or response body in logs or state.
-      throw new Error("Slack delivery failed: HTTP " + response.status);
+    if (result.kind === "rate-limited") {
+      state.slackNextPostAt = now() + result.retryAfterMs;
+      await persist();
+      throw new SlackDeliveryError("Slack delivery rate limited");
+    }
+    if (result.kind === "thread-missing") {
+      if (message.transferId) delete state.slackThreads[message.transferId];
+      state.slackNextPostAt = now() + 1000;
+      await persist();
+      return;
+    }
+    if (result.kind === "bot") {
+      state.slackNextPostAt = now() + 1000;
+      if (message.transferId && !threadTs)
+        state.slackThreads[message.transferId] = {
+          channelId: result.channelId,
+          ts: result.ts,
+        };
     }
     state.delivered[message.key] = {
       fingerprint: message.fingerprint,

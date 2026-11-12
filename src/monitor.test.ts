@@ -11,7 +11,8 @@ import {
   MsgSinkResponse,
   DestType,
 } from "@akashnetwork/chain-sdk/private-types/akash.v1";
-import { configSchema, slackWebhook } from "./config";
+import { configSchema } from "./config";
+import { slackWebhook, slackTarget, type SlackTarget } from "./slack";
 import {
   monitorStateSchema,
   type MonitorState,
@@ -26,6 +27,7 @@ import {
   deliverOutbox,
   updateAlerts,
   updateTransfers,
+  queueMessage,
 } from "./alerts";
 import { pauseImport, squadsUrl, pausePanelUrl } from "./pause";
 import { createHash } from "node:crypto";
@@ -114,6 +116,8 @@ function state(): MonitorState {
     reporterActivity: null,
     snapshot: null,
     active: {},
+    slackThreads: {},
+    slackNextPostAt: 0,
     delivered: {},
     outbox: [],
     events: [],
@@ -225,7 +229,7 @@ test("account limits notify once per native epoch, including across restarts", a
   assert(!s.outbox[0].text.includes("<@"));
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {},
     now: () => now,
@@ -316,7 +320,7 @@ test("saved account alerts retire quietly while financial incidents stay active"
   updateAlerts(s, [legacy, critical], config, now);
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {},
     now: () => now,
@@ -393,7 +397,7 @@ test("failed Slack delivery survives restart; delivery is recorded only after ac
   await assert.rejects(
     deliverOutbox({
       state: original,
-      webhook: "https://hooks.slack.com/services/TEST",
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
       persist: async () => {},
       post: async () => new Response("rate_limited", { status: 429 }),
     }),
@@ -406,7 +410,7 @@ test("failed Slack delivery survives restart; delivery is recorded only after ac
   let persisted = 0;
   await deliverOutbox({
     state: restarted,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {
       persisted++;
@@ -422,7 +426,7 @@ test("warning escalation bypasses cooldown; changing details does not spam", asy
   updateAlerts(s, [{ ...critical, severity: "warning" }], config, 1000);
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {},
     now: () => 1000,
@@ -511,7 +515,7 @@ test("a recurring critical condition replaces an undelivered recovery, bypassing
   updateAlerts(s, [critical], config, 1000);
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {},
     now: () => 1000,
@@ -528,7 +532,7 @@ test("BME-style cooldown suppresses severity reductions until the repeat interva
   updateAlerts(s, [critical], config, 1000);
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async () => new Response("ok"),
     persist: async () => {},
     now: () => 1000,
@@ -919,7 +923,7 @@ test("periodic summaries survive restarts and wait two hours after delivery", as
   await assert.rejects(
     deliverOutbox({
       state: s,
-      webhook: "https://hooks.slack.com/services/TEST",
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
       post: async () => new Response("invalid_token", { status: 400 }),
       persist: async () => {},
     }),
@@ -934,7 +938,7 @@ test("periodic summaries survive restarts and wait two hours after delivery", as
   let persisted = "";
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     post: async (_url, init) => {
       assert.match(String(init?.body), /Updates unavailable/);
       return new Response("ok");
@@ -1106,7 +1110,10 @@ test("a hung observation still delivers a due summary after immediate critical a
       queueSummary(s, config, 7200_000);
       await deliverOutbox({
         state: s,
-        webhook: "https://hooks.slack.com/services/TEST",
+        target: {
+          kind: "webhook",
+          url: "https://hooks.slack.com/services/TEST",
+        },
         post: async (_url, init) => {
           delivered.push(String(init?.body));
           return new Response("ok");
@@ -1165,7 +1172,7 @@ test("first connection coalesces recovery and baseline into one useful update", 
   observationUnavailable(s, config, now - 1000);
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     persist: async () => {},
     post: async () => new Response("ok"),
     now: () => now - 1000,
@@ -1181,7 +1188,7 @@ test("first connection coalesces recovery and baseline into one useful update", 
   let deliveredId = "";
   await deliverOutbox({
     state: s,
-    webhook: "https://hooks.slack.com/services/TEST",
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
     persist: async () => {},
     post: async (_url, init) => {
       const body = z
@@ -1208,4 +1215,351 @@ test("human-readable AKT amounts keep every micro-unit, including large balances
   assert.equal(formatAkt("1000001"), "1.000001");
   assert.equal(formatAkt("-1"), "-0.000001");
   assert.equal(formatAkt("9500000000000000001"), "9,500,000,000,000.000001");
+});
+
+const slackBot = {
+  kind: "bot",
+  token: "xoxb-test-token",
+  channelId: "C123TEST",
+} satisfies SlackTarget;
+const slackBodySchema = z.object({
+  text: z.string(),
+  channel: z.string(),
+  thread_ts: z.string().optional(),
+  reply_broadcast: z.literal(false),
+  unfurl_links: z.literal(false),
+  unfurl_media: z.literal(false),
+});
+function slackReply(ts: string, channel = slackBot.channelId) {
+  return new Response(JSON.stringify({ ok: true, channel, ts }));
+}
+
+test("transfer status and receipt updates reply to their persisted original message", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  let next = structuredClone(s.snapshot);
+  next.transfers = [transfer()];
+  let now = 1000;
+  const bodies: z.infer<typeof slackBodySchema>[] = [];
+  const send = async () =>
+    deliverOutbox({
+      state: s,
+      target: slackBot,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      persist: async () => {},
+      post: async (url, init) => {
+        assert.equal(url, "https://slack.com/api/chat.postMessage");
+        assert.equal(
+          new Headers(init?.headers).get("authorization"),
+          "Bearer " + slackBot.token,
+        );
+        bodies.push(slackBodySchema.parse(JSON.parse(String(init?.body))));
+        return slackReply(`1700000000.00000${bodies.length}`);
+      },
+    });
+  updateTransfers(s, next, now, config);
+  assert.equal(s.outbox[0].transferId, transfer().id);
+  s.snapshot = next;
+  await send();
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  next = structuredClone(next);
+  next.transfers[0].akash = "STATUS_TRANSFER_MINTED";
+  next.transfers[0].solana = "minted";
+  updateTransfers(s, next, now, config);
+  s.snapshot = next;
+  await send();
+  next = structuredClone(next);
+  next.transfers[0].depositTxHash = "AB".repeat(32);
+  next.transfers[0].solanaTxSignature = base58.encode(
+    new Uint8Array(64).fill(7),
+  );
+  updateTransfers(s, next, now, config);
+  s.snapshot = next;
+  await send();
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[0].thread_ts, undefined);
+  assert.match(bodies[0].text, /New bridge deposit/);
+  assert.equal(bodies[1].thread_ts, "1700000000.000001");
+  assert.equal(bodies[2].thread_ts, "1700000000.000001");
+  assert.match(bodies[2].text, /Transfer receipts available/);
+  assert.match(bodies[2].text, /Original deposit/);
+  assert.match(bodies[2].text, /Solana transaction/);
+  assert(bodies.every((body) => !body.text.includes("<@")));
+  assert(!JSON.stringify(s).includes(slackBot.token));
+});
+
+test("queued transfers get separate parents while critical alerts remain in the channel", async () => {
+  const s = state();
+  for (const [index, id] of [
+    "akash1a/100/1",
+    "akash1b/100/2",
+    "akash1a/100/1",
+  ].entries())
+    queueMessage(s, {
+      key: `transfer:${index}`,
+      transferId: id,
+      fingerprint: "status",
+      text: id,
+      now: index,
+    });
+  updateAlerts(s, [{ ...critical, transferId: "akash1a/100/1" }], config, 10);
+  let now = 1000;
+  const bodies: z.infer<typeof slackBodySchema>[] = [];
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    persist: async () => {},
+    post: async (_url, init) => {
+      bodies.push(slackBodySchema.parse(JSON.parse(String(init?.body))));
+      return slackReply(`1700000000.00000${bodies.length}`);
+    },
+  });
+  assert.match(bodies[0].text, /Backing mismatch/);
+  assert.equal(bodies[0].thread_ts, undefined);
+  assert.equal(bodies[1].thread_ts, undefined);
+  assert.equal(bodies[2].thread_ts, undefined);
+  assert.equal(bodies[3].thread_ts, "1700000000.000002");
+  assert.equal(Object.keys(s.slackThreads).length, 2);
+});
+
+test("parent checkpoint survives an interrupted batch before its reply is sent", async () => {
+  const s = state();
+  const id = "akash1a/100/1";
+  for (const key of ["parent", "receipt"])
+    queueMessage(s, {
+      key,
+      transferId: id,
+      fingerprint: key,
+      text: key,
+      now: 0,
+    });
+  let checkpoint = "";
+  let calls = 0;
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target: slackBot,
+      now: () => 1000,
+      post: async () => {
+        calls++;
+        return slackReply("1700000000.000001");
+      },
+      persist: async () => {
+        checkpoint = JSON.stringify(s);
+        throw new Error("interrupted after checkpoint");
+      },
+    }),
+  );
+  assert.equal(calls, 1);
+  const restored = monitorStateSchema.parse(JSON.parse(checkpoint));
+  await deliverOutbox({
+    state: restored,
+    target: slackBot,
+    now: () => 2000,
+    persist: async () => {},
+    post: async (_url, init) => {
+      const body = slackBodySchema.parse(JSON.parse(String(init?.body)));
+      assert.equal(body.text, "receipt");
+      assert.equal(body.thread_ts, "1700000000.000001");
+      return slackReply("1700000000.000002");
+    },
+  });
+  assert.equal(restored.outbox.length, 0);
+  assert.equal(restored.slackThreads[id].ts, "1700000000.000001");
+});
+
+test("Slack API errors never mark messages delivered or fall back to a flat webhook post", async () => {
+  for (const response of [
+    { ok: false, error: "invalid_auth" },
+    { ok: false, error: "thread_not_found" },
+    { ok: true, channel: slackBot.channelId },
+    { ok: true, channel: "COTHER", ts: "1700000000.000001" },
+  ]) {
+    const s = state();
+    queueMessage(s, {
+      key: "parent",
+      transferId: "akash1a/1/1",
+      fingerprint: "new",
+      text: "parent",
+      now: 0,
+    });
+    let calls = 0;
+    await assert.rejects(
+      deliverOutbox({
+        state: s,
+        target: slackBot,
+        persist: async () => {
+          assert.fail("failed post must not checkpoint delivery");
+        },
+        post: async () => {
+          calls++;
+          return new Response(JSON.stringify(response));
+        },
+      }),
+    );
+    assert.equal(calls, 1);
+    assert.equal(s.outbox.length, 1);
+    assert.deepEqual(s.slackThreads, {});
+    assert.deepEqual(s.delivered, {});
+  }
+});
+
+test("Slack rate-limit cooldown persists without blocking polling or losing the message", async () => {
+  let s = state();
+  queueMessage(s, {
+    key: "parent",
+    transferId: "akash1a/1/1",
+    fingerprint: "new",
+    text: "parent",
+    now: 0,
+  });
+  let persisted = 0;
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target: slackBot,
+      now: () => 1000,
+      persist: async () => {
+        persisted++;
+      },
+      post: async () =>
+        new Response(null, { status: 429, headers: { "Retry-After": "30" } }),
+    }),
+  );
+  assert.equal(persisted, 1);
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  assert.equal(s.slackNextPostAt, 31000);
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    now: () => 2000,
+    persist: async () => {},
+    post: async () => {
+      assert.fail("provider cooldown must be respected");
+    },
+  });
+  assert.equal(s.outbox.length, 1);
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    now: () => 31000,
+    persist: async () => {},
+    post: async () => slackReply("1700000000.000001"),
+  });
+  assert.equal(s.outbox.length, 0);
+});
+
+test("changing Slack channels creates a new parent rather than replying in the old channel", async () => {
+  const s = state();
+  const id = "akash1a/1/1";
+  s.slackThreads[id] = { channelId: "COLD", ts: "1700000000.000001" };
+  queueMessage(s, {
+    key: "update",
+    transferId: id,
+    fingerprint: "new",
+    text: "update",
+    now: 0,
+  });
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    persist: async () => {},
+    post: async (_url, init) => {
+      const body = slackBodySchema.parse(JSON.parse(String(init?.body)));
+      assert.equal(body.thread_ts, undefined);
+      assert.equal(body.channel, slackBot.channelId);
+      return slackReply("1700000000.000002");
+    },
+  });
+  assert.deepEqual(s.slackThreads[id], {
+    channelId: slackBot.channelId,
+    ts: "1700000000.000002",
+  });
+});
+
+test("bot delivery requires a complete credential pair and old state gains empty thread tracking", () => {
+  const webhook = "https://hooks.slack.com/services/TEST";
+  assert.deepEqual(slackTarget({ SINK_MONITOR_SLACK_WEBHOOK: webhook }), {
+    kind: "webhook",
+    url: webhook,
+  });
+  assert.deepEqual(
+    slackTarget({
+      SINK_MONITOR_SLACK_WEBHOOK: webhook,
+      SINK_MONITOR_SLACK_BOT_TOKEN: slackBot.token,
+      SINK_MONITOR_SLACK_CHANNEL_ID: slackBot.channelId,
+    }),
+    slackBot,
+  );
+  for (const env of [
+    { SINK_MONITOR_SLACK_BOT_TOKEN: slackBot.token },
+    { SINK_MONITOR_SLACK_CHANNEL_ID: slackBot.channelId },
+    {
+      SINK_MONITOR_SLACK_BOT_TOKEN: slackBot.token,
+      SINK_MONITOR_SLACK_CHANNEL_ID: "akash-sink-monitor",
+    },
+    {
+      SINK_MONITOR_SLACK_BOT_TOKEN: "xoxp-user-token",
+      SINK_MONITOR_SLACK_CHANNEL_ID: slackBot.channelId,
+    },
+  ])
+    assert.throws(() => slackTarget(env));
+  assert.equal(slackTarget({}), undefined);
+  const { slackThreads, slackNextPostAt, ...legacy } = state();
+  const restored = monitorStateSchema.parse(legacy);
+  assert.deepEqual(restored.slackThreads, {});
+  assert.equal(restored.slackNextPostAt, 0);
+});
+
+test("a deleted Slack parent is replaced on the next attempt without losing the update", async () => {
+  const s = state();
+  const id = "akash1a/1/1";
+  s.slackThreads[id] = {
+    channelId: slackBot.channelId,
+    ts: "1700000000.000001",
+  };
+  queueMessage(s, {
+    key: "update",
+    transferId: id,
+    fingerprint: "new",
+    text: "update",
+    now: 0,
+  });
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    now: () => 1000,
+    persist: async () => {},
+    post: async (_url, init) => {
+      const body = slackBodySchema.parse(JSON.parse(String(init?.body)));
+      assert.equal(body.thread_ts, "1700000000.000001");
+      return new Response(
+        JSON.stringify({ ok: false, error: "thread_not_found" }),
+      );
+    },
+  });
+  assert.equal(s.outbox.length, 1);
+  assert.deepEqual(s.delivered, {});
+  assert.deepEqual(s.slackThreads, {});
+  await deliverOutbox({
+    state: s,
+    target: slackBot,
+    now: () => 2000,
+    persist: async () => {},
+    post: async (_url, init) => {
+      const body = slackBodySchema.parse(JSON.parse(String(init?.body)));
+      assert.equal(body.thread_ts, undefined);
+      assert.equal(body.text, "update");
+      return slackReply("1700000000.000002");
+    },
+  });
+  assert.equal(s.outbox.length, 0);
+  assert.equal(s.slackThreads[id].ts, "1700000000.000002");
 });

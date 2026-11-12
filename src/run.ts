@@ -4,7 +4,8 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { web3 } from "@coral-xyz/anchor";
 import { atomicJson, optionalJson, withUploadLock } from "../vendor/durable";
-import { configSchema, slackWebhook, type Config } from "./config";
+import { configSchema, type Config } from "./config";
+import { slackTarget, SlackDeliveryError } from "./slack";
 import { monitorStateSchema, type MonitorState } from "./model";
 import { collectSnapshot } from "./snapshot";
 import { evaluate } from "./policy";
@@ -79,9 +80,9 @@ export async function run(
   config: Config,
   options: { once: boolean; notify: boolean },
 ) {
-  const webhook = options.notify ? slackWebhook(process.env) : undefined;
+  const target = options.notify ? slackTarget(process.env) : undefined;
   if (options.notify) {
-    assert(webhook, "--notify requires SINK_MONITOR_SLACK_WEBHOOK");
+    assert(target, "--notify requires Slack webhook or bot credentials");
     assert(
       config.slackMemberId,
       "--notify requires your Slack member ID; display names do not notify reliably",
@@ -108,6 +109,8 @@ export async function run(
             reporterActivity: null,
             snapshot: null,
             active: {},
+            slackThreads: {},
+            slackNextPostAt: 0,
             delivered: {},
             outbox: [],
             events: [],
@@ -132,11 +135,17 @@ export async function run(
       await atomicJson(file, state);
     };
     const notify = async () => {
-      if (!webhook) return;
+      if (!target) return;
       try {
-        await deliverOutbox({ state, webhook, persist });
-      } catch {
-        log("slack-delivery-failed", { queued: state.outbox.length });
+        await deliverOutbox({ state, target, persist });
+      } catch (error) {
+        log("slack-delivery-failed", {
+          queued: state.outbox.length,
+          reason:
+            error instanceof SlackDeliveryError
+              ? error.message
+              : "Slack request or checkpoint failed",
+        });
       }
     };
     const watchdog = async () => {
@@ -158,6 +167,7 @@ export async function run(
       programId: config.programId,
       mint: config.mint,
       notifications: options.notify,
+      slackDelivery: target?.kind ?? "disabled",
       channelLabel: config.slackChannel,
     });
     try {
@@ -292,7 +302,7 @@ async function main() {
   if (values.check) {
     log("configuration-valid", {
       notificationsReady: Boolean(
-        config.slackMemberId && slackWebhook(process.env),
+        config.slackMemberId && slackTarget(process.env),
       ),
     });
     return;

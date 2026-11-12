@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { base58 } from "@scure/base";
+import { slackThreadSchema } from "./slack";
 
 export const uint = z.string().regex(/^(0|[1-9][0-9]*)$/);
 export const txHashSchema = z.string().regex(/^[A-F0-9]{64}$/);
@@ -110,6 +111,8 @@ export const monitorStateSchema = z.object({
   reporterActivity: reporterActivitySchema.nullable().default(null),
   snapshot: snapshotSchema.nullable(),
   active: z.record(z.string(), alertSchema),
+  slackThreads: z.record(z.string(), slackThreadSchema).default({}),
+  slackNextPostAt: z.number().nonnegative().default(0),
   delivered: z.record(
     z.string(),
     z.object({
@@ -124,6 +127,7 @@ export const monitorStateSchema = z.object({
       text: z.string(),
       createdAt: z.number(),
       fingerprint: z.string(),
+      transferId: z.string().optional(),
     }),
   ),
   events: z.array(
