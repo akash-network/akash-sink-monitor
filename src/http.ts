@@ -4,6 +4,7 @@ import type { MonitorState } from "./model";
 import { squadsUrl } from "./pause";
 import { healthLines } from "./summary";
 import { reporterHealth } from "./reporters";
+import { batchedActivityCount } from "./activity";
 
 const page = `<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width"><title>Akash Sink Monitor</title>
@@ -84,6 +85,16 @@ export function metrics(
     config.summaryIntervalSeconds,
   );
   const s = state.snapshot;
+  gauge(
+    "akash_sink_monitor_activity_digest_mode",
+    "Whether routine activity notifications are being grouped into digests.",
+    Number(state.activityNotifications.mode.kind === "digest"),
+  );
+  gauge(
+    "akash_sink_monitor_activity_batched",
+    "Routine activity notifications accumulated for the next digest.",
+    batchedActivityCount(state),
+  );
   if (s) {
     gauge(
       "akash_sink_client_header_age_seconds",

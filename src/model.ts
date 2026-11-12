@@ -103,6 +103,29 @@ export const reporterActivitySchema = z.object({
 });
 export type ReporterActivity = z.infer<typeof reporterActivitySchema>;
 
+export const activityNoticeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("deposit"), amountUakt: uint }),
+  z.object({ kind: z.literal("update") }),
+  z.object({ kind: z.literal("receipt") }),
+  z.object({ kind: z.literal("burn"), amountUakt: uint }),
+  z.object({ kind: z.literal("rejection") }),
+  z.object({ kind: z.literal("earlier") }),
+]);
+export type ActivityNotice = z.infer<typeof activityNoticeSchema>;
+const activityBatchSchema = z.object({
+  since: z.number(),
+  through: z.number(),
+  deposits: z.number().int().nonnegative(),
+  depositedUakt: uint,
+  updates: z.number().int().nonnegative(),
+  receipts: z.number().int().nonnegative(),
+  burns: z.number().int().nonnegative(),
+  burnedUakt: uint,
+  rejections: z.number().int().nonnegative(),
+  earlier: z.number().int().nonnegative(),
+  sampleTransferIds: z.array(z.string()).max(3),
+});
+
 export const monitorStateSchema = z.object({
   version: z.literal(1),
   identity: z.string(),
@@ -113,6 +136,18 @@ export const monitorStateSchema = z.object({
   active: z.record(z.string(), alertSchema),
   slackThreads: z.record(z.string(), slackThreadSchema).default({}),
   slackNextPostAt: z.number().nonnegative().default(0),
+  activityNotifications: z
+    .object({
+      mode: z.discriminatedUnion("kind", [
+        z.object({
+          kind: z.literal("individual"),
+          recent: z.array(z.number()),
+        }),
+        z.object({ kind: z.literal("digest"), lastActivityAt: z.number() }),
+      ]),
+      pending: activityBatchSchema.nullable(),
+    })
+    .default({ mode: { kind: "individual", recent: [] }, pending: null }),
   delivered: z.record(
     z.string(),
     z.object({
@@ -128,6 +163,8 @@ export const monitorStateSchema = z.object({
       createdAt: z.number(),
       fingerprint: z.string(),
       transferId: z.string().optional(),
+      activity: activityNoticeSchema.optional(),
+      activityAdmitted: z.boolean().default(false),
     }),
   ),
   events: z.array(

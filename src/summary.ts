@@ -2,6 +2,8 @@ import type { Config } from "./config";
 import type { MonitorState } from "./model";
 import { queueMessage } from "./alerts";
 import { reporterHealth } from "./reporters";
+import { groupTransferAlerts } from "./transfer-alerts";
+import { batchedActivityCount } from "./activity";
 import {
   accountLimitDetail,
   accountLimitsNearCapacity,
@@ -47,7 +49,7 @@ export function summaryText(
   const s = state.snapshot;
   const fresh =
     !!s && now - Date.parse(s.checkedAt) < config.staleSeconds * 1000;
-  const alerts = Object.values(state.active).sort(
+  const alerts = groupTransferAlerts(Object.values(state.active), s).sort(
     (a, b) =>
       Number(b.severity === "critical") - Number(a.severity === "critical"),
   );
@@ -139,6 +141,10 @@ export function summaryText(
           : ""),
     );
   if (config.publicUrl) sections.push(`<${config.publicUrl}|Open dashboard>`);
+  if (state.activityNotifications.mode.kind === "digest")
+    sections.push(
+      `*Activity notifications*\nBusy-period grouping is active: one digest every ${duration(config.activityDigestSeconds)}. ${batchedActivityCount(state).toLocaleString("en-US")} updates awaiting the next digest.`,
+    );
   return sections.join("\n\n");
 }
 

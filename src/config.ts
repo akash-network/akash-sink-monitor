@@ -52,6 +52,8 @@ export const configSchema = z
     capCriticalPercent: z.number().int().min(1).max(100).default(95),
     alertRepeatSeconds: z.number().int().min(60).default(600),
     summaryIntervalSeconds: z.number().int().min(60).default(7200),
+    activityBurstLimit: z.number().int().min(1).max(100).default(5),
+    activityDigestSeconds: z.number().int().min(60).default(600),
     slackMemberId: z
       .string()
       .regex(/^[UW][A-Z0-9]+$/)

@@ -19,6 +19,7 @@ import {
 import { serve } from "./http";
 import { scanTransactions } from "./transactions";
 import { queueSummary } from "./summary";
+import { prepareActivityNotifications } from "./activity";
 import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
 import { updateAccountLimitNotices } from "./account-limits";
@@ -111,6 +112,10 @@ export async function run(
             active: {},
             slackThreads: {},
             slackNextPostAt: 0,
+            activityNotifications: {
+              mode: { kind: "individual", recent: [] },
+              pending: null,
+            },
             delivered: {},
             outbox: [],
             events: [],
@@ -123,7 +128,9 @@ export async function run(
       "state directory belongs to another deployment",
     );
     updateAccountLimitNotices(state, config, Date.now());
+    updateAlerts(state, Object.values(state.active), config, Date.now());
     const persist = async () => {
+      prepareActivityNotifications(state, config, Date.now());
       // Audit events are written before advancing the snapshot. Stable IDs
       // make a repeated write after a crash harmless.
       for (const event of state.events)
@@ -217,9 +224,10 @@ export async function run(
               queueMessage(state, {
                 key: event.id,
                 fingerprint: event.id,
+                activity: { kind: "rejection" },
                 now,
                 text:
-                  "*🔴 Deposit rejected*\n\nThe deposit was not accepted on Akash.\n\n" +
+                  "*ℹ️ Deposit rejected*\n\nThe deposit was not accepted on Akash.\n\n" +
                   akashTxLink(event.txHash, config),
               });
             }

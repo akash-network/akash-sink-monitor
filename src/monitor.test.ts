@@ -49,6 +49,7 @@ import { queueSummary, summaryText } from "./summary";
 import { Script } from "node:vm";
 import { formatAkt } from "./format";
 import { updateAccountLimitNotices } from "./account-limits";
+import { batchedActivityCount, prepareActivityNotifications } from "./activity";
 
 const config = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
@@ -118,6 +119,10 @@ function state(): MonitorState {
     active: {},
     slackThreads: {},
     slackNextPostAt: 0,
+    activityNotifications: {
+      mode: { kind: "individual", recent: [] },
+      pending: null,
+    },
     delivered: {},
     outbox: [],
     events: [],
@@ -1233,6 +1238,333 @@ const slackBodySchema = z.object({
 function slackReply(ts: string, channel = slackBot.channelId) {
   return new Response(JSON.stringify({ ok: true, channel, ts }));
 }
+
+test("thousands of deposits become five notices and one exact digest while every transfer is audited", async () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const next = snapshot();
+  next.transfers = Array.from({ length: 2000 }, (_, i) => ({
+    ...transfer(),
+    id: `akash1sender${i}/100/1`,
+    owner: `akash1sender${i}`,
+    amountUakt: "1000001",
+  }));
+  const now = Date.parse(next.checkedAt);
+  updateTransfers(s, next, now, config);
+  s.snapshot = next;
+  prepareActivityNotifications(s, config, now);
+  assert.equal(s.events.length, 2000);
+  assert.equal(s.outbox.filter((message) => message.transferId).length, 5);
+  assert.equal(s.outbox.length, 6);
+  assert.equal(batchedActivityCount(s), 1995);
+  const digest = s.outbox.find((message) => message.key === "activity-digest");
+  assert(digest);
+  assert.match(digest.text, /New deposits:\* 1,995 · 1,995\.001995 AKT/);
+  assert(digest.text.length < 2000);
+  assert(!digest.text.includes("<@"));
+  assert.deepEqual(evaluate(next, config), []);
+  assert.match(summaryText(s, config, now), /Akash Sink · All clear/);
+  assert.match(
+    metrics(s, true, config, now),
+    /akash_sink_monitor_activity_digest_mode 1/,
+  );
+  assert.match(
+    metrics(s, true, config, now),
+    /akash_sink_monitor_activity_batched 1995/,
+  );
+  updateAlerts(s, [critical], config, now);
+  queueSummary(s, config, now);
+  const delivered: string[] = [];
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => now,
+    persist: async () => {},
+    post: async (_url, init) => {
+      delivered.push(String(init?.body));
+      return new Response("ok");
+    },
+  });
+  assert.equal(delivered.length, 8);
+  assert.match(delivered[0], /Backing mismatch/);
+  assert.match(delivered[1], /Akash Sink/);
+  assert.equal(batchedActivityCount(s), 0);
+  assert.equal(s.outbox.length, 0);
+});
+
+test("sustained traffic stays in digest mode across restarts and resumes individual notices after quiet", async () => {
+  let s = state();
+  const enqueue = (
+    now: number,
+    count: number,
+    kind: "receipt" | "update" = "update",
+  ) => {
+    for (let i = 0; i < count; i++)
+      queueMessage(s, {
+        key: `transfer:${now}:${i}`,
+        fingerprint: "status",
+        text: "Routine update",
+        transferId: `akash1sender/100/${i}`,
+        activity: { kind },
+        now,
+      });
+    prepareActivityNotifications(s, config, now);
+  };
+  let now = 1000;
+  const sent: string[] = [];
+  const send = async () =>
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      now: () => now,
+      persist: async () => {
+        prepareActivityNotifications(s, config, now);
+      },
+      post: async (_url, init) => {
+        sent.push(String(init?.body));
+        return new Response("ok");
+      },
+    });
+  enqueue(now, 10);
+  await send();
+  assert.equal(sent.length, 6);
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  for (let minute = 1; minute <= 20; minute++) {
+    now = 1000 + minute * 60_000;
+    enqueue(now, 100, "receipt");
+    await send();
+    assert.equal(s.activityNotifications.mode.kind, "digest");
+    s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  }
+  assert.equal(sent.length, 8);
+  assert.equal(
+    sent.filter((text) => text.includes("Bridge activity digest")).length,
+    3,
+  );
+  assert.match(sent[7], /Receipt updates:\* 1,000/);
+  now += config.activityDigestSeconds * 1000;
+  prepareActivityNotifications(s, config, now);
+  assert.equal(s.activityNotifications.mode.kind, "individual");
+  enqueue(now, 1);
+  assert.equal(s.outbox[0].key, `transfer:${now}:0`);
+});
+
+test("failed digests retain totals and absorb more activity without accumulating messages", async () => {
+  let s = state();
+  const enqueue = (start: number, count: number) => {
+    for (let i = start; i < start + count; i++)
+      queueMessage(s, {
+        key: `rejection-${i}`,
+        fingerprint: `${i}`,
+        activity: { kind: "rejection" },
+        text: "Rejected deposit",
+        now: 1000 + i,
+      });
+    prepareActivityNotifications(s, config, 2000);
+  };
+  enqueue(0, 10);
+  let requests = 0;
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      now: () => 2000,
+      persist: async () => {},
+      post: async () =>
+        ++requests <= 5
+          ? new Response("ok")
+          : new Response("failed", { status: 500 }),
+    }),
+  );
+  assert.equal(s.outbox.length, 1);
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  enqueue(10, 1000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(batchedActivityCount(s), 1005);
+  assert.match(s.outbox[0].text, /Rejected deposit transactions:\* 1,005/);
+  prepareActivityNotifications(s, config, 3000);
+  assert.equal(batchedActivityCount(s), 1005);
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => 3000,
+    persist: async () => {},
+    post: async () => new Response("ok"),
+  });
+  assert.equal(batchedActivityCount(s), 0);
+});
+
+test("a final partial batch flushes after traffic stops, without looking like a Slack delivery failure while waiting", async () => {
+  const s = state();
+  s.activityNotifications.mode = { kind: "digest", lastActivityAt: 0 };
+  s.delivered["activity-digest"] = {
+    fingerprint: "activity-digest",
+    sentAt: 0,
+  };
+  queueMessage(s, {
+    key: "burn:test",
+    fingerprint: "test",
+    text: "Burn",
+    now: 1000,
+    activity: { kind: "burn", amountUakt: "9500000000000000001" },
+  });
+  prepareActivityNotifications(s, config, 1000);
+  assert.equal(s.outbox.length, 0);
+  assert.equal(batchedActivityCount(s), 1);
+  assert.match(
+    metrics(s, false, config, 1000),
+    /akash_sink_monitor_outbox_pending 0/,
+  );
+  const restored = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  prepareActivityNotifications(restored, config, 601_000);
+  assert.equal(restored.outbox.length, 1);
+  assert.match(
+    restored.outbox[0].text,
+    /Burns:\* 1 · 9,500,000,000,000\.000001 AKT/,
+  );
+  await deliverOutbox({
+    state: restored,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => 601_000,
+    persist: async () => {
+      prepareActivityNotifications(restored, config, 601_000);
+    },
+    post: async () => new Response("ok"),
+  });
+  assert.equal(restored.activityNotifications.mode.kind, "individual");
+  assert.equal(batchedActivityCount(restored), 0);
+});
+
+test("a long Slack outage cannot build an unbounded queue of admitted individual notices", () => {
+  const s = state();
+  for (let interval = 0; interval < 10; interval++) {
+    const now = interval * config.activityDigestSeconds * 1000;
+    for (let i = 0; i < 5; i++)
+      queueMessage(s, {
+        key: `transfer:${interval}:${i}`,
+        fingerprint: "status",
+        text: "Update",
+        now,
+        activity: { kind: "update" },
+      });
+    prepareActivityNotifications(s, config, now);
+  }
+  assert.equal(
+    s.outbox.filter((message) => message.activityAdmitted).length,
+    5,
+  );
+  assert.equal(s.outbox.length, 6);
+  assert.equal(batchedActivityCount(s), 45);
+});
+
+test("upgrade compacts legacy activity backlog but preserves financial and missing-history messages", () => {
+  const s = state();
+  for (let i = 0; i < 2000; i++)
+    queueMessage(s, {
+      key: `transfer:legacy${i}`,
+      fingerprint: "pending",
+      text: "Old update",
+      now: i,
+    });
+  queueMessage(s, {
+    key: "burn:123",
+    fingerprint: "123",
+    text: "Missing burn receipts",
+    now: 2001,
+  });
+  updateAlerts(s, [critical], config, 2002);
+  const legacy = JSON.parse(JSON.stringify(s));
+  delete legacy.activityNotifications;
+  for (const message of legacy.outbox) delete message.activityAdmitted;
+  const restored = monitorStateSchema.parse(legacy);
+  prepareActivityNotifications(restored, config, 3000);
+  assert.equal(restored.outbox.length, 8);
+  assert.match(
+    restored.outbox.find((message) => message.key === "activity-digest")
+      ?.text ?? "",
+    /Earlier queued notifications:\* 1,995/,
+  );
+  assert(restored.outbox.some((message) => message.key === "alert:backing"));
+  assert(restored.outbox.some((message) => message.key === "burn:123"));
+  assert.equal(restored.active.backing.severity, "critical");
+});
+
+test("transfer incidents group by category with escalation, refresh, recovery and complete underlying state", async () => {
+  const s = state();
+  s.snapshot = snapshot();
+  s.snapshot.transfers = Array.from({ length: 2000 }, (_, i) => ({
+    ...transfer(),
+    id: `akash1sender/100/${i}`,
+  }));
+  const incidents = s.snapshot.transfers.map((row): Alert => ({
+    key: `pending:${row.id}`,
+    severity: "warning",
+    title: "Transfer remains unresolved",
+    detail: "Waiting for confirmation",
+    transferId: row.id,
+  }));
+  updateAlerts(s, incidents, config, 1000);
+  assert.equal(Object.keys(s.active).length, 2000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:pending:group");
+  assert.match(s.outbox[0].text, /2,000 affected transfers · 2,000 AKT/);
+  const send = async (now: number) =>
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      now: () => now,
+      persist: async () => {},
+      post: async () => new Response("ok"),
+    });
+  await send(1000);
+  updateAlerts(s, incidents.slice(1), config, 2000);
+  assert.equal(s.outbox.length, 0);
+  const escalated = incidents.map((alert): Alert => ({
+    ...alert,
+    severity: "critical",
+  }));
+  updateAlerts(s, escalated, { ...config, slackMemberId: "U123TEST" }, 3000);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /<@U123TEST>/);
+  updateAlerts(s, escalated.slice(1), config, 3001);
+  assert.match(s.outbox[0].text, /1,999 affected transfers/);
+  await send(3001);
+  updateAlerts(s, [...escalated.slice(2), critical], config, 4000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:backing");
+  await send(4000);
+  updateAlerts(s, [critical], config, 5000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].fingerprint, "resolved");
+  assert.equal(s.outbox[0].key, "alert:pending:group");
+});
+
+test("legacy per-transfer alerts collapse without thousands of recovery messages", () => {
+  const s = state();
+  const alerts = Array.from({ length: 1000 }, (_, i): Alert => ({
+    key: `settlement:akash1sender/100/${i}`,
+    transferId: `akash1sender/100/${i}`,
+    severity: "critical",
+    title: "Contradictory cross-chain settlement",
+    detail: "Conflicting outcomes",
+  }));
+  s.active = Object.fromEntries(alerts.map((alert) => [alert.key, alert]));
+  for (const alert of alerts) {
+    queueMessage(s, {
+      key: "alert:" + alert.key,
+      fingerprint: "critical",
+      text: "Old alert",
+      now: 0,
+    });
+    s.delivered["alert:" + alert.key] = { fingerprint: "critical", sentAt: 0 };
+  }
+  updateAlerts(s, alerts, config, 1000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:settlement:group");
+  assert.match(s.outbox[0].text, /Open your Squad/);
+  updateAlerts(s, [], config, 2000);
+  assert.equal(s.outbox.length, 0);
+});
 
 test("transfer status and receipt updates reply to their persisted original message", async () => {
   let s = state();

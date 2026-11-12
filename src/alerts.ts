@@ -1,7 +1,17 @@
 import { createHash } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
 import type { Config } from "./config";
-import type { Alert, MonitorState, Snapshot, Transfer } from "./model";
+import type {
+  ActivityNotice,
+  Alert,
+  MonitorState,
+  Snapshot,
+  Transfer,
+} from "./model";
+import {
+  groupTransferAlerts,
+  isIndividualTransferAlert,
+} from "./transfer-alerts";
 import { squadsUrl, pausePanelUrl } from "./pause";
 import { solanaTxLink, transferLinks } from "./links";
 import { formatAkt, slackEscape, statusLabel } from "./format";
@@ -73,6 +83,7 @@ export function queueMessage(
     text: string;
     now: number;
     transferId?: string;
+    activity?: ActivityNotice;
   },
 ) {
   const { key, fingerprint, text, now } = input;
@@ -82,6 +93,7 @@ export function queueMessage(
   if (existing?.fingerprint === fingerprint) {
     existing.text = text;
     existing.transferId = input.transferId;
+    existing.activity = input.activity;
     return;
   }
   state.outbox = state.outbox.filter((row) => row.key !== key);
@@ -92,6 +104,8 @@ export function queueMessage(
     text,
     createdAt: now,
     transferId: input.transferId,
+    activity: input.activity,
+    activityAdmitted: false,
   });
 }
 
@@ -101,8 +115,19 @@ export function updateAlerts(
   config: Config,
   now: number,
 ) {
-  const active = Object.fromEntries(alerts.map((alert) => [alert.key, alert]));
-  for (const [key, previous] of Object.entries(state.active)) {
+  const notifications = groupTransferAlerts(alerts, state.snapshot);
+  const active = Object.fromEntries(
+    notifications.map((alert) => [alert.key, alert]),
+  );
+  const previousNotifications = groupTransferAlerts(
+    Object.values(state.active),
+    state.snapshot,
+  );
+  state.outbox = state.outbox.filter(
+    (message) => !isIndividualTransferAlert(message.key),
+  );
+  for (const previous of previousNotifications) {
+    const key = previous.key;
     if (active[key]) continue;
     state.outbox = state.outbox.filter((row) => row.key !== "alert:" + key);
     if (state.delivered["alert:" + key]) {
@@ -117,7 +142,10 @@ export function updateAlerts(
       });
     }
   }
-  for (const alert of alerts) {
+  const previouslyActive = new Set(
+    previousNotifications.map((alert) => alert.key),
+  );
+  for (const alert of notifications) {
     const key = "alert:" + alert.key;
     const fingerprint = alert.severity;
     const sent = state.delivered[key];
@@ -125,11 +153,12 @@ export function updateAlerts(
       (row) => row.key !== key || row.fingerprint !== "resolved",
     );
     if (
-      !state.active[alert.key] ||
+      !previouslyActive.has(alert.key) ||
       !sent ||
       sent.fingerprint === "resolved" ||
       (fingerprint === "critical" && sent.fingerprint !== "critical") ||
-      now - sent.sentAt >= config.alertRepeatSeconds * 1000
+      now - sent.sentAt >= config.alertRepeatSeconds * 1000 ||
+      state.outbox.some((message) => message.key === key)
     ) {
       queueMessage(state, {
         key,
@@ -139,7 +168,7 @@ export function updateAlerts(
       });
     }
   }
-  state.active = active;
+  state.active = Object.fromEntries(alerts.map((alert) => [alert.key, alert]));
 }
 
 export function updateTransfers(
@@ -184,6 +213,9 @@ export function updateTransfers(
     queueMessage(state, {
       key: "transfer:" + id,
       transferId: row.id,
+      activity: !prior
+        ? { kind: "deposit", amountUakt: row.amountUakt }
+        : { kind: fingerprint === oldFingerprint ? "receipt" : "update" },
       fingerprint,
       now,
       text: transferText(
@@ -207,6 +239,7 @@ export function updateTransfers(
       queueMessage(state, {
         key: "burn:" + burn.signature,
         fingerprint: burn.signature,
+        activity: { kind: "burn", amountUakt: burn.amount },
         now,
         text: `*🔥 Solana AKT burned*\n\n*Amount:* ${formatAkt(burn.amount)} AKT\n\n${solanaTxLink(burn.signature, config)}`,
       });
@@ -243,7 +276,10 @@ export async function deliverOutbox(input: {
   state.outbox.sort(
     (a, b) =>
       Number(b.fingerprint === "critical") -
-        Number(a.fingerprint === "critical") || a.createdAt - b.createdAt,
+        Number(a.fingerprint === "critical") ||
+      Number(b.key.startsWith("alert:") || b.key === "summary") -
+        Number(a.key.startsWith("alert:") || a.key === "summary") ||
+      a.createdAt - b.createdAt,
   );
   for (const message of state.outbox.slice(0, 10)) {
     if (target.kind === "bot") {
@@ -288,6 +324,8 @@ export async function deliverOutbox(input: {
       sentAt: now(),
     };
     state.outbox = state.outbox.filter((row) => row.id !== message.id);
+    if (message.key === "activity-digest")
+      state.activityNotifications.pending = null;
     await persist();
   }
 }
