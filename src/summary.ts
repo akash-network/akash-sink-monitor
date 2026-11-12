@@ -126,6 +126,11 @@ export function summaryText(
     sections.push(
       `*Last confirmed balances*\nEscrow: ${formatAkt(s.lockedUakt)} AKT · Supply: ${formatAkt(s.supplyUakt)} AKT`,
     );
+  const totals = state.transferTotals;
+  if (totals)
+    sections.push(
+      `*Transfer activity · ${duration((Date.parse(totals.through) - Date.parse(totals.since)) / 1000)} observed*\n*New deposits:* ${totals.deposits.toLocaleString("en-US")} transfer${totals.deposits === 1 ? "" : "s"} · ${formatAkt(totals.depositedUakt)} AKT\n*Minted on Solana:* ${totals.mints.toLocaleString("en-US")} transfer${totals.mints === 1 ? "" : "s"} · ${formatAkt(totals.mintedUakt)} AKT${fresh ? "" : "\nLast confirmed activity; counts will catch up when observations resume."}`,
+    );
   const issues = alerts.filter(
     (alert) => alert.key !== "observation-unavailable",
   );
@@ -141,7 +146,10 @@ export function summaryText(
           : ""),
     );
   if (config.publicUrl) sections.push(`<${config.publicUrl}|Open dashboard>`);
-  if (state.activityNotifications.mode.kind === "digest")
+  if (
+    config.transferNotifications &&
+    state.activityNotifications.mode.kind === "digest"
+  )
     sections.push(
       `*Activity notifications*\nBusy-period grouping is active: one digest every ${duration(config.activityDigestSeconds)}. ${batchedActivityCount(state).toLocaleString("en-US")} updates awaiting the next digest.`,
     );
@@ -168,6 +176,9 @@ export function queueSummary(state: MonitorState, config: Config, now: number) {
   const pending = state.outbox.find((message) => message.key === "summary");
   if (pending) {
     pending.text = summaryText(state, config, now);
+    pending.summaryTotals = state.transferTotals
+      ? { ...state.transferTotals }
+      : undefined;
     return;
   }
   const delivered = state.delivered.summary;
@@ -182,5 +193,8 @@ export function queueSummary(state: MonitorState, config: Config, now: number) {
     fingerprint: "summary",
     text: summaryText(state, config, now),
     now,
+    summaryTotals: state.transferTotals
+      ? { ...state.transferTotals }
+      : undefined,
   });
 }

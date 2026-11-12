@@ -84,6 +84,8 @@ export function queueMessage(
     now: number;
     transferId?: string;
     activity?: ActivityNotice;
+    summaryTotals?: MonitorState["outbox"][number]["summaryTotals"];
+    capResetGroups?: MonitorState["outbox"][number]["capResetGroups"];
   },
 ) {
   const { key, fingerprint, text, now } = input;
@@ -94,6 +96,8 @@ export function queueMessage(
     existing.text = text;
     existing.transferId = input.transferId;
     existing.activity = input.activity;
+    existing.summaryTotals = input.summaryTotals;
+    existing.capResetGroups = input.capResetGroups;
     return;
   }
   state.outbox = state.outbox.filter((row) => row.key !== key);
@@ -106,6 +110,8 @@ export function queueMessage(
     transferId: input.transferId,
     activity: input.activity,
     activityAdmitted: false,
+    summaryTotals: input.summaryTotals,
+    capResetGroups: input.capResetGroups,
   });
 }
 
@@ -178,6 +184,15 @@ export function updateTransfers(
   config: Config,
 ) {
   const previous = state.snapshot;
+  const totals = (state.transferTotals ??= {
+    since: previous?.checkedAt ?? next.checkedAt,
+    through: previous?.checkedAt ?? next.checkedAt,
+    deposits: 0,
+    depositedUakt: "0",
+    mints: 0,
+    mintedUakt: "0",
+  });
+  totals.through = next.checkedAt;
   if (!previous) return;
   const old = new Map(previous.transfers.map((row) => [row.id, row]));
   for (const row of next.transfers) {
@@ -209,25 +224,38 @@ export function updateTransfers(
     );
     if (!state.events.some((entry) => entry.id === id)) {
       state.events.push({ id, at: next.checkedAt, detail });
+      if (!prior) {
+        totals.deposits++;
+        totals.depositedUakt = (
+          BigInt(totals.depositedUakt) + BigInt(row.amountUakt)
+        ).toString();
+      }
+      if (row.solana === "minted" && prior?.solana !== "minted") {
+        totals.mints++;
+        totals.mintedUakt = (
+          BigInt(totals.mintedUakt) + BigInt(row.amountUakt)
+        ).toString();
+      }
     }
-    queueMessage(state, {
-      key: "transfer:" + id,
-      transferId: row.id,
-      activity: !prior
-        ? { kind: "deposit", amountUakt: row.amountUakt }
-        : { kind: fingerprint === oldFingerprint ? "receipt" : "update" },
-      fingerprint,
-      now,
-      text: transferText(
-        row,
-        config,
-        fingerprint === oldFingerprint
-          ? "🔗 Transfer receipts available"
-          : prior
-            ? "↔️ Bridge transfer updated"
-            : "💸 New bridge deposit",
-      ),
-    });
+    if (config.transferNotifications)
+      queueMessage(state, {
+        key: "transfer:" + id,
+        transferId: row.id,
+        activity: !prior
+          ? { kind: "deposit", amountUakt: row.amountUakt }
+          : { kind: fingerprint === oldFingerprint ? "receipt" : "update" },
+        fingerprint,
+        now,
+        text: transferText(
+          row,
+          config,
+          fingerprint === oldFingerprint
+            ? "🔗 Transfer receipts available"
+            : prior
+              ? "↔️ Bridge transfer updated"
+              : "💸 New bridge deposit",
+        ),
+      });
   }
   if (BigInt(next.burnedUakt) > BigInt(previous.burnedUakt)) {
     const delta = (
@@ -236,13 +264,14 @@ export function updateTransfers(
     let linked = 0n;
     for (const burn of next.burns) {
       linked += BigInt(burn.amount);
-      queueMessage(state, {
-        key: "burn:" + burn.signature,
-        fingerprint: burn.signature,
-        activity: { kind: "burn", amountUakt: burn.amount },
-        now,
-        text: `*🔥 Solana AKT burned*\n\n*Amount:* ${formatAkt(burn.amount)} AKT\n\n${solanaTxLink(burn.signature, config)}`,
-      });
+      if (config.transferNotifications)
+        queueMessage(state, {
+          key: "burn:" + burn.signature,
+          fingerprint: burn.signature,
+          activity: { kind: "burn", amountUakt: burn.amount },
+          now,
+          text: `*🔥 Solana AKT burned*\n\n*Amount:* ${formatAkt(burn.amount)} AKT\n\n${solanaTxLink(burn.signature, config)}`,
+        });
     }
     if (linked !== BigInt(delta))
       queueMessage(state, {
@@ -326,6 +355,23 @@ export async function deliverOutbox(input: {
     state.outbox = state.outbox.filter((row) => row.id !== message.id);
     if (message.key === "activity-digest")
       state.activityNotifications.pending = null;
+    if (
+      message.key === "summary" &&
+      message.summaryTotals &&
+      state.transferTotals
+    ) {
+      const reported = message.summaryTotals;
+      const totals = state.transferTotals;
+      totals.since = reported.through;
+      totals.deposits -= reported.deposits;
+      totals.depositedUakt = (
+        BigInt(totals.depositedUakt) - BigInt(reported.depositedUakt)
+      ).toString();
+      totals.mints -= reported.mints;
+      totals.mintedUakt = (
+        BigInt(totals.mintedUakt) - BigInt(reported.mintedUakt)
+      ).toString();
+    }
     await persist();
   }
 }

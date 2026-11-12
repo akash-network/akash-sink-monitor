@@ -86,6 +86,18 @@ export function prepareActivityNotifications(
   now: number,
 ) {
   const activity = state.activityNotifications;
+  if (!config.transferNotifications) {
+    state.outbox = state.outbox.filter(
+      (message) =>
+        message.fingerprint === "critical" ||
+        (!notice(message) &&
+          message.key !== "activity-digest" &&
+          !message.key.startsWith("notice:account:")),
+    );
+    activity.mode = { kind: "individual", recent: [] };
+    activity.pending = null;
+    return;
+  }
   const interval = config.activityDigestSeconds * 1000;
   if (
     activity.mode.kind === "digest" &&

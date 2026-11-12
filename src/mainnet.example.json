@@ -22,6 +22,7 @@
   "capCriticalPercent": 95,
   "alertRepeatSeconds": 600,
   "summaryIntervalSeconds": 7200,
+  "transferNotifications": false,
   "staleSeconds": 120,
   "startupGraceSeconds": 300,
   "listenHost": "127.0.0.1",

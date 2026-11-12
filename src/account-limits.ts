@@ -48,7 +48,7 @@ export function updateAccountLimitNotices(
     state.snapshot &&
     now - Date.parse(state.snapshot.checkedAt) < config.staleSeconds * 1000;
   const caps =
-    fresh && state.snapshot
+    config.transferNotifications && fresh && state.snapshot
       ? accountLimitsNearCapacity(state.snapshot, config)
       : [];
   state.outbox = state.outbox.filter(

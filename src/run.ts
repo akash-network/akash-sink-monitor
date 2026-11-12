@@ -24,6 +24,7 @@ import { akashTxLink } from "./links";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
 import { updateAccountLimitNotices } from "./account-limits";
 import { solanaRpcFetch } from "./rpc";
+import { queueCapResets } from "./cap-resets";
 
 const log = (event: string, fields: object = {}) =>
   process.stdout.write(
@@ -109,6 +110,8 @@ export async function run(
             rejectionHeight: 0,
             reporterActivity: null,
             snapshot: null,
+            transferTotals: null,
+            capPeriods: {},
             active: {},
             slackThreads: {},
             slackNextPostAt: 0,
@@ -129,6 +132,7 @@ export async function run(
     );
     updateAccountLimitNotices(state, config, Date.now());
     updateAlerts(state, Object.values(state.active), config, Date.now());
+    queueCapResets(state, config, Date.now());
     const persist = async () => {
       prepareActivityNotifications(state, config, Date.now());
       // Audit events are written before advancing the snapshot. Stable IDs
@@ -221,15 +225,16 @@ export async function run(
             for (const event of indexed.events) {
               if (!state.events.some((entry) => entry.id === event.id))
                 state.events.push(event);
-              queueMessage(state, {
-                key: event.id,
-                fingerprint: event.id,
-                activity: { kind: "rejection" },
-                now,
-                text:
-                  "*ℹ️ Deposit rejected*\n\nThe deposit was not accepted on Akash.\n\n" +
-                  akashTxLink(event.txHash, config),
-              });
+              if (config.transferNotifications)
+                queueMessage(state, {
+                  key: event.id,
+                  fingerprint: event.id,
+                  activity: { kind: "rejection" },
+                  now,
+                  text:
+                    "*ℹ️ Deposit rejected*\n\nThe deposit was not accepted on Akash.\n\n" +
+                    akashTxLink(event.txHash, config),
+                });
             }
             if (indexed.height < snapshot.akashHeight)
               alerts.push({
@@ -268,6 +273,7 @@ export async function run(
           });
         }
         updateAccountLimitNotices(state, config, Date.now());
+        queueCapResets(state, config, Date.now());
         if (options.notify && !options.once)
           queueSummary(state, config, Date.now());
         await persist();

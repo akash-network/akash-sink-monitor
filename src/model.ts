@@ -126,6 +126,15 @@ const activityBatchSchema = z.object({
   sampleTransferIds: z.array(z.string()).max(3),
 });
 
+export const transferTotalsSchema = z.object({
+  since: z.string().datetime(),
+  through: z.string().datetime(),
+  deposits: z.number().int().nonnegative(),
+  depositedUakt: uint,
+  mints: z.number().int().nonnegative(),
+  mintedUakt: uint,
+});
+
 export const monitorStateSchema = z.object({
   version: z.literal(1),
   identity: z.string(),
@@ -133,6 +142,8 @@ export const monitorStateSchema = z.object({
   rejectionHeight: z.number().int().nonnegative(),
   reporterActivity: reporterActivitySchema.nullable().default(null),
   snapshot: snapshotSchema.nullable(),
+  transferTotals: transferTotalsSchema.nullable().default(null),
+  capPeriods: z.record(z.string(), z.string()).default({}),
   active: z.record(z.string(), alertSchema),
   slackThreads: z.record(z.string(), slackThreadSchema).default({}),
   slackNextPostAt: z.number().nonnegative().default(0),
@@ -165,6 +176,8 @@ export const monitorStateSchema = z.object({
       transferId: z.string().optional(),
       activity: activityNoticeSchema.optional(),
       activityAdmitted: z.boolean().default(false),
+      summaryTotals: transferTotalsSchema.optional(),
+      capResetGroups: z.array(z.enum(["akash", "solana"])).optional(),
     }),
   ),
   events: z.array(

@@ -50,8 +50,10 @@ import { Script } from "node:vm";
 import { formatAkt } from "./format";
 import { updateAccountLimitNotices } from "./account-limits";
 import { batchedActivityCount, prepareActivityNotifications } from "./activity";
+import { queueCapResets } from "./cap-resets";
 
-const config = configSchema.parse(mainnet);
+const config = configSchema.parse({ ...mainnet, transferNotifications: true });
+const quietConfig = configSchema.parse(mainnet);
 function snapshot(): Snapshot {
   return {
     checkedAt: "2026-11-10T00:00:00.000Z",
@@ -116,6 +118,8 @@ function state(): MonitorState {
     rejectionHeight: 0,
     reporterActivity: null,
     snapshot: null,
+    transferTotals: null,
+    capPeriods: {},
     active: {},
     slackThreads: {},
     slackNextPostAt: 0,
@@ -1894,4 +1898,289 @@ test("a deleted Slack parent is replaced on the next attempt without losing the 
   });
   assert.equal(s.outbox.length, 0);
   assert.equal(s.slackThreads[id].ts, "1700000000.000002");
+});
+
+test("default notifications report transfer counts and exact AKT totals only in summaries", () => {
+  assert.equal(quietConfig.transferNotifications, false);
+  const s = state();
+  const baseline = snapshot();
+  baseline.transfers = [{ ...transfer(), solana: "minted" }];
+  const start = Date.parse(baseline.checkedAt);
+  updateTransfers(s, baseline, start, quietConfig);
+  s.snapshot = baseline;
+  const next = structuredClone(baseline);
+  next.checkedAt = new Date(start + 7200_000).toISOString();
+  for (let i = 0; i < 2000; i++)
+    next.transfers.push({
+      ...transfer(),
+      id: `akash1sender/101/${i}`,
+      amountUakt: "1000001",
+      solana: i < 1500 ? "minted" : "pending",
+    });
+  updateTransfers(s, next, start + 7200_000, quietConfig);
+  s.snapshot = next;
+  prepareActivityNotifications(s, quietConfig, start + 7200_000);
+  assert.equal(s.outbox.length, 0);
+  assert.equal(s.events.length, 2000);
+  assert.equal(s.transferTotals?.deposits, 2000);
+  assert.equal(s.transferTotals.mints, 1500);
+  const text = summaryText(s, quietConfig, start + 7200_000);
+  assert.match(text, /Transfer activity · 2h observed/);
+  assert.match(text, /New deposits:\* 2,000 transfers · 2,000\.002 AKT/);
+  assert.match(text, /Minted on Solana:\* 1,500 transfers · 1,500\.0015 AKT/);
+  const receipts = structuredClone(next);
+  receipts.checkedAt = new Date(start + 7215_000).toISOString();
+  receipts.transfers[1].depositTxHash = "AB".repeat(32);
+  updateTransfers(s, receipts, start + 7215_000, quietConfig);
+  s.snapshot = receipts;
+  updateTransfers(s, receipts, start + 7215_000, quietConfig);
+  assert.equal(s.transferTotals.deposits, 2000);
+  assert.equal(s.transferTotals.mints, 1500);
+  assert.equal(s.outbox.length, 0);
+});
+
+test("summary totals survive failed delivery and restarts and advance only after acceptance", async () => {
+  let s = state();
+  const baseline = snapshot();
+  const start = Date.parse(baseline.checkedAt);
+  updateTransfers(s, baseline, start, quietConfig);
+  s.snapshot = baseline;
+  const next = structuredClone(baseline);
+  next.checkedAt = new Date(start + 7200_000).toISOString();
+  next.transfers = [transfer()];
+  updateTransfers(s, next, start + 7200_000, quietConfig);
+  s.snapshot = next;
+  queueSummary(s, quietConfig, start + 7200_000);
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      persist: async () => {},
+      post: async () => new Response("failed", { status: 500 }),
+    }),
+  );
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  assert.equal(s.transferTotals?.deposits, 1);
+  const later = structuredClone(next);
+  later.checkedAt = new Date(start + 7260_000).toISOString();
+  later.transfers[0].solana = "minted";
+  later.transfers.push({
+    ...transfer(),
+    id: "akash1sender/101/1",
+    amountUakt: "9500000000000000001",
+  });
+  updateTransfers(s, later, start + 7260_000, quietConfig);
+  s.snapshot = later;
+  queueSummary(s, quietConfig, start + 7260_000);
+  assert.equal(s.outbox.length, 1);
+  assert.match(
+    s.outbox[0].text,
+    /New deposits:\* 2 transfers · 9,500,000,000,001\.000001 AKT/,
+  );
+  assert.match(s.outbox[0].text, /Minted on Solana:\* 1 transfer · 1 AKT/);
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => start + 7260_000,
+    persist: async () => {},
+    post: async () => new Response("ok"),
+  });
+  assert.deepEqual(s.transferTotals, {
+    since: later.checkedAt,
+    through: later.checkedAt,
+    deposits: 0,
+    depositedUakt: "0",
+    mints: 0,
+    mintedUakt: "0",
+  });
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  queueSummary(s, quietConfig, start + 7260_001);
+  assert.equal(s.outbox.length, 0);
+});
+
+test("accepting a queued summary preserves activity observed after its checkpoint", async () => {
+  const s = state();
+  const baseline = snapshot();
+  const start = Date.parse(baseline.checkedAt);
+  updateTransfers(s, baseline, start, quietConfig);
+  s.snapshot = baseline;
+  const first = {
+    ...snapshot(),
+    checkedAt: new Date(start + 1000).toISOString(),
+    transfers: [transfer()],
+  };
+  updateTransfers(s, first, start + 1000, quietConfig);
+  s.snapshot = first;
+  queueSummary(s, quietConfig, start + 1000);
+  const second = structuredClone(first);
+  second.checkedAt = new Date(start + 2000).toISOString();
+  second.transfers[0].solana = "minted";
+  second.transfers.push({ ...transfer(), id: "akash1sender/102/1" });
+  updateTransfers(s, second, start + 2000, quietConfig);
+  s.snapshot = second;
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => start + 2000,
+    persist: async () => {},
+    post: async () => new Response("ok"),
+  });
+  assert.deepEqual(s.transferTotals, {
+    since: first.checkedAt,
+    through: second.checkedAt,
+    deposits: 1,
+    depositedUakt: "1000000",
+    mints: 1,
+    mintedUakt: "1000000",
+  });
+});
+
+test("quiet upgrade drops routine backlog and digests while preserving audit and incident state", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const next = {
+    ...snapshot(),
+    transfers: Array.from({ length: 10 }, (_, i) => ({
+      ...transfer(),
+      id: `akash1sender/100/${i}`,
+    })),
+  };
+  updateTransfers(s, next, 0, config);
+  s.snapshot = next;
+  prepareActivityNotifications(s, config, 0);
+  queueMessage(s, {
+    key: "rejection-old",
+    fingerprint: "old",
+    text: "Old rejection",
+    now: 0,
+  });
+  queueMessage(s, {
+    key: "notice:account:old",
+    fingerprint: "old",
+    text: "Old account limit",
+    now: 0,
+  });
+  updateAlerts(s, [critical], quietConfig, 0);
+  queueSummary(s, quietConfig, 0);
+  prepareActivityNotifications(s, quietConfig, 0);
+  assert.deepEqual(s.outbox.map((message) => message.key).sort(), [
+    "alert:backing",
+    "summary",
+  ]);
+  assert.equal(s.events.length, 10);
+  assert.equal(s.snapshot.transfers.length, 10);
+  assert.equal(s.transferTotals?.deposits, 10);
+  assert.equal(s.active.backing.severity, "critical");
+  assert.equal(batchedActivityCount(s), 0);
+  assert(!summaryText(s, quietConfig, 0).includes("Busy-period grouping"));
+});
+
+test("cap resets combine chains and account allowances into one restart-safe notice", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  s.snapshot.caps = [
+    {
+      key: "akash-send",
+      label: "Akash deposits",
+      usedUakt: "500000",
+      limitUakt: "1000000",
+      period: "Native Akash day epoch 42",
+    },
+    {
+      key: "akash-refund",
+      label: "Akash refunds",
+      usedUakt: "0",
+      limitUakt: "2000000",
+      period: "Native Akash day epoch 42",
+    },
+    {
+      key: "solana-mint",
+      label: "Solana mints",
+      usedUakt: "500000",
+      limitUakt: "1000000",
+      period: "Solana UTC mint day 20000",
+    },
+    ...Array.from({ length: 1000 }, (_, i) => ({
+      key: `account:${i}`,
+      label: `Account ${i}`,
+      usedUakt: "1000000",
+      limitUakt: "1000000",
+      period: "Native Akash day epoch 42",
+    })),
+  ];
+  queueCapResets(s, quietConfig, now);
+  updateAccountLimitNotices(s, quietConfig, now);
+  assert.equal(s.outbox.length, 0);
+  for (const cap of s.snapshot.caps) {
+    cap.period =
+      cap.key === "solana-mint"
+        ? "Solana UTC mint day 20001"
+        : "Native Akash day epoch 43";
+    cap.usedUakt = "0";
+  }
+  queueCapResets(s, quietConfig, now);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /Daily caps reset/);
+  assert.match(s.outbox[0].text, /Akash deposits: 1 \/ 1 AKT available/);
+  assert.match(s.outbox[0].text, /Account daily allowances also reset/);
+  assert(!s.outbox[0].text.includes("<@"));
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      persist: async () => {},
+      post: async () => new Response("failed", { status: 500 }),
+    }),
+  );
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  queueCapResets(s, quietConfig, now + 1);
+  assert.equal(s.outbox.length, 1);
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    now: () => now + 1,
+    persist: async () => {},
+    post: async () => new Response("ok"),
+  });
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  queueCapResets(s, quietConfig, now + 2);
+  assert.equal(s.outbox.length, 0);
+  assert(s.snapshot);
+  s.snapshot.caps[2].period = "Solana UTC mint day 20002";
+  queueCapResets(s, quietConfig, now + 3);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /Solana UTC mint day 20002/);
+  assert(!s.outbox[0].text.includes("Akash deposits"));
+});
+
+test("cap resets require a fresh changed period, not a lower usage counter or restart", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const now = Date.parse(s.snapshot.checkedAt);
+  s.snapshot.caps = [
+    {
+      key: "akash-send",
+      label: "Akash deposits",
+      usedUakt: "800000",
+      limitUakt: "1000000",
+      period: "Native Akash day epoch 42",
+    },
+  ];
+  queueCapResets(s, quietConfig, now + 600_000);
+  s.snapshot.caps[0].usedUakt = "0";
+  queueCapResets(s, quietConfig, now);
+  assert.equal(s.outbox.length, 0);
+  s.snapshot.caps[0].period = "Native Akash day epoch 43";
+  queueCapResets(s, quietConfig, now + 600_000);
+  assert.equal(s.outbox.length, 0);
+  s.snapshot.checkedAt = new Date(now + 600_000).toISOString();
+  queueCapResets(s, quietConfig, now + 600_000);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /epoch 43/);
+  s.snapshot.caps[0].period = "Native Akash day epoch 44";
+  queueCapResets(s, quietConfig, now + 600_001);
+  assert.equal(s.outbox.length, 1);
+  assert.match(s.outbox[0].text, /epoch 44/);
+  assert(!s.outbox[0].text.includes("epoch 43"));
 });
