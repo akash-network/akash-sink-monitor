@@ -28,6 +28,42 @@ function amount(value: unknown) {
   );
   return BigInt(value);
 }
+
+type Resolution =
+  | { solana: "pending"; resolvedAtSlot: null }
+  | { solana: "minted" | "voided"; resolvedAtSlot: bigint };
+
+function resolutionAtSnapshot(input: {
+  program: Program<Akt>;
+  record: ReturnType<typeof decodeRecord>;
+  info: web3.AccountInfo<Buffer> | null;
+  slot: number;
+}): Resolution {
+  const { program, record, info, slot } = input;
+  if (!info) return { solana: "pending", resolvedAtSlot: null };
+  assert.ok(info.owner.equals(program.programId) && !info.executable);
+  const status = program.coder.accounts.decode<
+    Awaited<ReturnType<typeof program.account.transferStatus.fetch>>
+  >("transferStatus", info.data);
+  assert.ok(matchesAnchorId(status.id, record.id), "status identity mismatch");
+  assert.ok(
+    BigInt(status.proofHeight.toString()) > record.height,
+    "proof predates deposit",
+  );
+  const resolvedAtSlot = BigInt(status.resolvedAtSlot.toString());
+  if (!inSnapshot(resolvedAtSlot, slot))
+    return { solana: "pending", resolvedAtSlot: null };
+  if (status.outcome.minted) {
+    assert.equal(
+      BigInt(status.outcome.minted.amount.toString()),
+      record.amount,
+    );
+    assert.ok(status.outcome.minted.recipient.equals(record.recipient));
+    return { solana: "minted", resolvedAtSlot };
+  }
+  return { solana: "voided", resolvedAtSlot };
+}
+
 // Burn accounting comes from successful finalized SPL instructions, including
 // inner CPI calls. It is independent of the supply difference being checked.
 async function indexBurns(
@@ -220,17 +256,53 @@ export async function reconcileConfigured(input: {
       assert.ok(page.context.slot >= snapshot.context.slot);
       infos.push(...page.value);
     }
-    // Deposits created after the Akash snapshot could already have minted. Retry
-    // rather than report a false supply gap from mismatched chain snapshots.
+    // Later deposits can be left to the next poll unless they already minted
+    // at the pinned supply slot. Only that case invalidates this backing set.
     const freshState = await akash.state();
+    assert.ok(freshState.height >= state.height, "Akash snapshot regressed");
     const freshHistory = await collectPages((key) =>
       akash.transfers(freshState.height, { key, limit: 500 }),
     );
+    const knownIds = new Set(records.map(({ record }) => record.id));
     assert.deepEqual(
-      freshHistory.map((entry) => entry.id),
+      freshHistory
+        .filter((entry) => knownIds.has(entry.id))
+        .map((entry) => entry.id),
       records.map((entry) => entry.record.id),
-      "deposits advanced during reconciliation; retry snapshot",
+      "transfer history disappeared or reordered during reconciliation",
     );
+    const arrivals = freshHistory
+      .filter((entry) => !knownIds.has(entry.id))
+      .map(({ transfer }) => decodeRecord(transfer));
+    for (const record of arrivals)
+      assert.ok(
+        record.height > BigInt(state.height),
+        "earlier deposit missing from snapshot",
+      );
+    for (let i = 0; i < arrivals.length; i += 100) {
+      const batch = arrivals.slice(i, i + 100);
+      const page = await connection.getMultipleAccountsInfoAndContext(
+        batch.map((record) => statusAddress(programId, record.id)),
+        { commitment: "finalized", minContextSlot: snapshot.context.slot },
+      );
+      assert.ok(page.context.slot >= snapshot.context.slot);
+      assert.equal(
+        page.value.length,
+        batch.length,
+        "incomplete new-deposit status page",
+      );
+      for (const [index, record] of batch.entries())
+        assert.notEqual(
+          resolutionAtSnapshot({
+            program,
+            record,
+            info: page.value[index],
+            slot: snapshot.context.slot,
+          }).solana,
+          "minted",
+          "new deposit already minted at snapshot slot; retry snapshot",
+        );
+    }
     const mintInfo = unpackMint(mint, infos[0], TOKEN_PROGRAM_ID);
     assert.equal(mintInfo.decimals, 6);
     assert.equal(mintInfo.freezeAuthority, null);
@@ -250,38 +322,22 @@ export async function reconcileConfigured(input: {
       const info = infos[i + 1];
       const settlement = transfer.settlement;
       assert.ok(settlement);
-      let solana: "minted" | "voided" | undefined;
-      let resolvedAtSlot: bigint | undefined;
-      if (info) {
-        assert.ok(info.owner.equals(programId) && !info.executable);
-        const status = program.coder.accounts.decode<
-          Awaited<ReturnType<typeof program.account.transferStatus.fetch>>
-        >("transferStatus", info.data);
-        assert.ok(
-          matchesAnchorId(status.id, record.id),
-          "status identity mismatch",
-        );
-        assert.ok(
-          BigInt(status.proofHeight.toString()) > record.height,
-          "proof predates deposit",
-        );
-        resolvedAtSlot = BigInt(status.resolvedAtSlot.toString());
-        if (!inSnapshot(resolvedAtSlot, snapshot.context.slot))
-          resolvedAtSlot = undefined;
-        else if (status.outcome.minted) {
-          assert.equal(
-            BigInt(status.outcome.minted.amount.toString()),
-            record.amount,
-          );
-          assert.ok(status.outcome.minted.recipient.equals(record.recipient));
-          solana = "minted";
-          observedMinted += record.amount;
-          if (
-            transfer.status === Status.STATUS_TRANSFER_PENDING ||
-            transfer.status === Status.STATUS_VOIDED
-          )
-            awaitingReports += record.amount;
-        } else solana = "voided";
+      const resolution = resolutionAtSnapshot({
+        program,
+        record,
+        info,
+        slot: snapshot.context.slot,
+      });
+      const solana =
+        resolution.solana === "pending" ? undefined : resolution.solana;
+      const resolvedAtSlot = resolution.resolvedAtSlot ?? undefined;
+      if (solana === "minted") {
+        observedMinted += record.amount;
+        if (
+          transfer.status === Status.STATUS_TRANSFER_PENDING ||
+          transfer.status === Status.STATUS_VOIDED
+        )
+          awaitingReports += record.amount;
       }
       if (
         solana !== "minted" &&
