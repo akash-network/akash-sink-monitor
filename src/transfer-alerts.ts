@@ -52,13 +52,23 @@ export function groupTransferAlerts(
         known++;
       }
     }
+    const examples = [...group]
+      .sort((a, b) => {
+        const amountA = BigInt(
+          transfers.get(a.transferId ?? "")?.amountUakt ?? "0",
+        );
+        const amountB = BigInt(
+          transfers.get(b.transferId ?? "")?.amountUakt ?? "0",
+        );
+        return amountA === amountB ? 0 : amountA > amountB ? -1 : 1;
+      })
+      .slice(0, 3);
     result.push({
       key: category + ":group",
       severity: first.severity,
       title: first.title,
-      detail: `${group.length.toLocaleString("en-US")} affected transfers${known === group.length ? ` · ${formatAkt(total.toString())} AKT` : ""}.\n\nExamples:\n${group
-        .slice(0, 3)
-        .map((alert) => `${alert.transferId}: ${alert.detail}`)
+      detail: `${group.length.toLocaleString("en-US")} affected transfers${known === group.length ? ` · ${formatAkt(total.toString())} AKT` : ""}.\n\n*${known === group.length ? "Largest affected transfers" : "Examples"}:*\n\n${examples
+        .map((alert) => `*${alert.transferId}*\n${alert.detail}`)
         .join(
           "\n\n",
         )}\n\nAll affected transfers remain in the monitor's status and audit records.`,
