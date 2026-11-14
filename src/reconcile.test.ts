@@ -41,11 +41,12 @@ function transfer(height: bigint) {
 
 function nativeState(
   height: number,
+  escrow = 2_000_000n,
 ): Awaited<ReturnType<AkashClient["state"]>> {
   const state = QueryStateResponse.fromPartial({
     epoch: 1n,
     totals: {
-      pendingAmount: coin(2_000_000n),
+      pendingAmount: coin(escrow),
       pendingCount: 2n,
       mintedAmount: coin(0n),
       voidedAmount: coin(0n),
@@ -71,7 +72,7 @@ function nativeState(
   };
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, recordCount = 2) {
   await mkdir(".cache", { recursive: true });
   const directory = await mkdtemp(".cache/reconcile-arrivals-");
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -87,18 +88,30 @@ async function fixture(t: TestContext) {
     }),
   );
   const original = [transfer(90n), transfer(91n)];
+  for (let i = 2; i < recordCount; i++) {
+    const row = transfer(92n);
+    assert(row.id);
+    row.id.sequence = BigInt(i);
+    original.push(row);
+  }
+  const escrow = BigInt(recordCount) * 1_000_000n;
   const arrival = transfer(101n);
   const current = {
     history: [...original, arrival],
     height: 102,
-    supply: 2_000_000n,
+    supply: escrow,
+    supplySlot: 1000,
+    clockSlot: 1000,
     laterSlot: 1000,
     truncateArrivalPage: false,
+    truncateOriginalPage: false,
+    burnRootSlot: 1002,
+    burnSlot: 0,
   };
   const accounts = new Map<string, web3.AccountInfo<Buffer>>();
   let stateReads = 0;
   t.mock.method(AkashClient.prototype, "state", async () =>
-    nativeState(stateReads++ === 0 ? 100 : current.height),
+    nativeState(stateReads++ === 0 ? 100 : current.height, escrow),
   );
   t.mock.method(AkashClient.prototype, "transfers", async (height: number) => ({
     transfers: height === 100 ? original : current.history,
@@ -119,7 +132,7 @@ async function fixture(t: TestContext) {
         key: new Uint8Array(),
         height: 100,
         value: QueryBalanceResponse.encode({
-          balance: coin(2_000_000n),
+          balance: coin(escrow),
         }).finish(),
       };
     },
@@ -145,7 +158,8 @@ async function fixture(t: TestContext) {
             })
             .parse(request.params[1]);
           const isSupplyPage = addresses.includes(mint.toBase58());
-          if (!isSupplyPage) assert.equal(options.minContextSlot, 1000);
+          if (!isSupplyPage)
+            assert.equal(options.minContextSlot, current.supplySlot);
           const data = Buffer.alloc(MintLayout.span);
           MintLayout.encode(
             {
@@ -159,8 +173,12 @@ async function fixture(t: TestContext) {
             },
             data,
           );
+          const clock = Buffer.alloc(40);
+          clock.writeBigUInt64LE(BigInt(current.clockSlot));
           const page = {
-            context: { slot: isSupplyPage ? 1000 : current.laterSlot },
+            context: {
+              slot: isSupplyPage ? current.supplySlot : current.laterSlot,
+            },
             value: addresses.map((address) => {
               const account =
                 address === mint.toBase58()
@@ -170,7 +188,16 @@ async function fixture(t: TestContext) {
                       lamports: 1,
                       executable: false,
                     }
-                  : accounts.get(address);
+                  : address === web3.SYSVAR_CLOCK_PUBKEY.toBase58()
+                    ? {
+                        data: clock,
+                        owner: new web3.PublicKey(
+                          "Sysvar1111111111111111111111111111111111111",
+                        ),
+                        lamports: 1,
+                        executable: false,
+                      }
+                    : accounts.get(address);
               return account
                 ? {
                     ...account,
@@ -182,6 +209,18 @@ async function fixture(t: TestContext) {
             }),
           };
           if (!isSupplyPage && current.truncateArrivalPage) page.value.pop();
+          const lastOriginal = original.at(-1);
+          assert(lastOriginal);
+          if (
+            current.truncateOriginalPage &&
+            addresses.includes(
+              statusAddress(
+                programId,
+                decodeRecord(lastOriginal).id,
+              ).toBase58(),
+            )
+          )
+            page.value.pop();
           result = page;
           break;
         }
@@ -191,8 +230,61 @@ async function fixture(t: TestContext) {
         case "getFirstAvailableBlock":
           result = 1;
           break;
-        case "getSignaturesForAddress":
-          result = [];
+        case "getSignaturesForAddress": {
+          const options = z
+            .object({
+              minContextSlot: z.number().optional(),
+              before: z.string().optional(),
+            })
+            .parse(request.params[1]);
+          if ((options.minContextSlot ?? 0) > current.burnRootSlot)
+            throw new Error("Minimum context slot has not been reached");
+          result =
+            current.burnSlot &&
+            current.burnSlot <= current.burnRootSlot &&
+            !options.before
+              ? [
+                  {
+                    signature: "burn-transaction",
+                    slot: current.burnSlot,
+                    err: null,
+                    memo: null,
+                    blockTime: 1,
+                  },
+                ]
+              : [];
+          break;
+        }
+        case "getTransaction":
+          result = {
+            slot: current.burnSlot,
+            blockTime: 1,
+            version: "legacy",
+            transaction: {
+              signatures: ["burn-transaction"],
+              message: {
+                accountKeys: [],
+                recentBlockhash: web3.PublicKey.default.toBase58(),
+                instructions: [
+                  {
+                    program: "spl-token",
+                    programId: TOKEN_PROGRAM_ID.toBase58(),
+                    parsed: {
+                      type: "burn",
+                      info: { mint: mint.toBase58(), amount: "1000000" },
+                    },
+                  },
+                ],
+              },
+            },
+            meta: {
+              err: null,
+              fee: 0,
+              preBalances: [],
+              postBalances: [],
+              innerInstructions: [],
+            },
+          };
           break;
         default:
           assert.fail("Unexpected RPC: " + request.method);
@@ -233,16 +325,22 @@ async function fixture(t: TestContext) {
     current,
     original,
     resolve,
+    clearStatus: (entry: TransferState) =>
+      accounts.delete(
+        statusAddress(programId, decodeRecord(entry).id).toBase58(),
+      ),
     directory,
-    reconcile: () =>
-      reconcileConfigured({
+    reconcile: () => {
+      stateReads = 0;
+      return reconcileConfigured({
         connection,
         programId,
         akashRpc: "https://akash.example",
         chainId: "akashnet-2",
         stateDir: directory,
         reportLagSeconds: 600,
-      }),
+      });
+    },
   };
 }
 
@@ -431,4 +529,132 @@ test("a malformed new-deposit status cannot count as an absent account", async (
   const account = await f.resolve(f.arrival, 1001);
   account.data = Buffer.alloc(account.data.length);
   await assert.rejects(f.reconcile(), /Invalid account discriminator/);
+});
+
+for (const recordCount of [2, 100]) {
+  test(`a short original account page with ${recordCount} deposits cannot create a backing alarm`, async (t) => {
+    const f = await fixture(t, recordCount);
+    f.current.truncateOriginalPage = true;
+    await assert.rejects(
+      f.reconcile().then((result) => {
+        t.diagnostic(JSON.stringify(result.report));
+        return result;
+      }),
+      /incomplete Solana account page/,
+    );
+    await assert.rejects(readFile(join(f.directory, "reconciliation.json")), {
+      code: "ENOENT",
+    });
+    const checkpoint = JSON.parse(
+      await readFile(join(f.directory, "burn-index.json"), "utf8"),
+    );
+    assert.equal(checkpoint.slot, 999);
+    f.current.truncateOriginalPage = false;
+    assert.equal((await f.reconcile()).report.status, "healthy");
+  });
+}
+
+test("a supply read one slot ahead of its context cannot create a false 1 AKT deficit", async (t) => {
+  const f = await fixture(t);
+  await f.resolve(f.original[1], 1001);
+  f.current.clockSlot = 1001;
+  f.current.laterSlot = 1002;
+  await assert.rejects(
+    f.reconcile().then((result) => {
+      t.diagnostic(JSON.stringify(result.report));
+      return result;
+    }),
+    /supply snapshot context disagrees with Clock/,
+  );
+  await assert.rejects(readFile(join(f.directory, "reconciliation.json")), {
+    code: "ENOENT",
+  });
+  const checkpoint = JSON.parse(
+    await readFile(join(f.directory, "burn-index.json"), "utf8"),
+  );
+  assert.equal(checkpoint.slot, 999);
+  f.current.supplySlot = 1001;
+  const { report } = await f.reconcile();
+  assert.equal(report.status, "healthy");
+  assert.equal(report.observedMintedUakt, "2000000");
+  assert.equal(report.solanaSupplyUakt, "2000000");
+  assert.equal(report.solanaSlot, 1001);
+});
+
+test("a Clock behind the supplied context is also an incomplete observation", async (t) => {
+  const f = await fixture(t);
+  f.current.clockSlot = 999;
+  await assert.rejects(
+    f.reconcile(),
+    /supply snapshot context disagrees with Clock/,
+  );
+});
+
+test("a mint after a coherent supply slot is excluded without an alarm", async (t) => {
+  const f = await fixture(t, 100);
+  const last = f.original.at(-1);
+  assert(last);
+  await f.resolve(last, 1001);
+  f.current.laterSlot = 1002;
+  f.current.supply -= 1_000_000n;
+  const { report } = await f.reconcile();
+  assert.equal(report.status, "healthy");
+  assert.equal(report.observedMintedUakt, "99000000");
+  assert.equal(report.solanaSlot, 1000);
+});
+
+for (const gap of [-1_000_000n, -1n, 1n, 1_000_000n]) {
+  test(`a coherent ${gap} uakt discrepancy still reaches the backing alarm immediately`, async (t) => {
+    const f = await fixture(t);
+    f.current.supply -= gap;
+    const { report } = await f.reconcile();
+    assert.equal(report.status, "mismatch");
+    assert(
+      report.alerts.includes(`backing minus supply and burns: ${gap} uakt`),
+    );
+  });
+}
+
+test("an explicit absent status on a complete page does not hide a genuine gap", async (t) => {
+  const f = await fixture(t);
+  f.clearStatus(f.original[1]);
+  const { report } = await f.reconcile();
+  assert(
+    report.alerts.includes("backing minus supply and burns: -1000000 uakt"),
+  );
+});
+
+test("a burn scan behind the supply slot cannot publish a false surplus or advance its checkpoint", async (t) => {
+  const f = await fixture(t);
+  f.current.burnSlot = 1000;
+  f.current.burnRootSlot = 999;
+  f.current.supply = 1_000_000n;
+  await assert.rejects(
+    f.reconcile(),
+    /Minimum context slot has not been reached/,
+  );
+  const checkpoint = JSON.parse(
+    await readFile(join(f.directory, "burn-index.json"), "utf8"),
+  );
+  assert.equal(checkpoint.slot, 999);
+  f.current.burnRootSlot = 1000;
+  const { report } = await f.reconcile();
+  assert.equal(report.status, "healthy");
+  assert.equal(report.cumulativeBurnedUakt, "1000000");
+});
+
+test("a concurrent burn belongs to its supply slot and is not counted again after checkpointing", async (t) => {
+  const f = await fixture(t);
+  f.current.burnSlot = 1001;
+  let result = await f.reconcile();
+  assert.equal(result.report.status, "healthy");
+  assert.equal(result.report.cumulativeBurnedUakt, "0");
+  f.current.supplySlot = f.current.clockSlot = f.current.laterSlot = 1001;
+  f.current.supply = 1_000_000n;
+  result = await f.reconcile();
+  assert.equal(result.report.status, "healthy");
+  assert.equal(result.report.cumulativeBurnedUakt, "1000000");
+  result = await f.reconcile();
+  assert.equal(result.report.status, "healthy");
+  assert.equal(result.report.cumulativeBurnedUakt, "1000000");
 });

@@ -113,7 +113,7 @@ async function indexBurns(
     );
     const rows = await connection.getSignaturesForAddress(
       mint,
-      { before, limit: 100 },
+      { before, limit: 100, minContextSlot: slot },
       "finalized",
     );
     if (!rows.length) break;
@@ -231,29 +231,56 @@ export async function reconcileConfigured(input: {
     const mint = pda("mint", programId);
     const addresses = [
       mint,
+      web3.SYSVAR_CLOCK_PUBKEY,
       ...records.map(({ record }) => statusAddress(programId, record.id)),
     ];
     // The first page pins the finalized slot for supply. Later pages may come
     // from a newer slot; statuses resolved after the pinned slot are excluded.
+    const minContextSlot = Number(
+      records.reduce((slot, { transfer }) => {
+        const reported = minimumSlot(transfer);
+        return reported > slot ? reported : slot;
+      }, 0n),
+    );
+    const firstPage = addresses.slice(0, 100);
     const snapshot = await connection.getMultipleAccountsInfoAndContext(
-      addresses.slice(0, 100),
-      {
-        commitment: "finalized",
-        minContextSlot: Number(
-          records.reduce((slot, { transfer }) => {
-            const reported = minimumSlot(transfer);
-            return reported > slot ? reported : slot;
-          }, 0n),
-        ),
-      },
+      firstPage,
+      { commitment: "finalized", minContextSlot },
+    );
+    assert.ok(snapshot.context.slot >= minContextSlot);
+    assert.equal(
+      snapshot.value.length,
+      firstPage.length,
+      "incomplete Solana account page",
+    );
+    const clock = snapshot.value[1];
+    assert.ok(
+      clock &&
+        !clock.executable &&
+        clock.owner.toBase58() ===
+          "Sysvar1111111111111111111111111111111111111" &&
+        clock.data.length === 40,
+      "Solana Clock unavailable in supply snapshot",
+    );
+    // An RPC can return account data newer than its advertised context.
+    assert.equal(
+      clock.data.readBigUInt64LE(0),
+      BigInt(snapshot.context.slot),
+      "Solana supply snapshot context disagrees with Clock; retry snapshot",
     );
     const infos = [...snapshot.value];
     for (let i = 100; i < addresses.length; i += 100) {
-      const page = await connection.getMultipleAccountsInfoAndContext(
-        addresses.slice(i, i + 100),
-        { commitment: "finalized", minContextSlot: snapshot.context.slot },
-      );
+      const batch = addresses.slice(i, i + 100);
+      const page = await connection.getMultipleAccountsInfoAndContext(batch, {
+        commitment: "finalized",
+        minContextSlot: snapshot.context.slot,
+      });
       assert.ok(page.context.slot >= snapshot.context.slot);
+      assert.equal(
+        page.value.length,
+        batch.length,
+        "incomplete Solana account page",
+      );
       infos.push(...page.value);
     }
     // Later deposits can be left to the next poll unless they already minted
@@ -319,7 +346,7 @@ export async function reconcileConfigured(input: {
       resolvedAtSlot: string | null;
     }[] = [];
     for (const [i, { transfer, record }] of records.entries()) {
-      const info = infos[i + 1];
+      const info = infos[i + 2];
       const settlement = transfer.settlement;
       assert.ok(settlement);
       const resolution = resolutionAtSnapshot({

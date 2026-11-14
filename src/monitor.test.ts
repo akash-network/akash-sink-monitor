@@ -158,6 +158,43 @@ test("independent burns reconcile supply; an extra minted unit is critical", () 
     "critical",
   );
 });
+test("both signs of a verified backing gap alert immediately and only coherent recovery clears them", () => {
+  for (const gap of [-1_000_000n, -1n, 1n, 1_000_000n]) {
+    const s = state();
+    const observed = snapshot();
+    const start = Date.parse(observed.checkedAt);
+    observed.supplyUakt = (BigInt(observed.mintedUakt) - gap).toString();
+    s.snapshot = observed;
+    updateAlerts(s, evaluate(observed, quietConfig), quietConfig, start);
+    assert.equal(s.active.backing.severity, "critical");
+    assert(s.outbox.some((message) => message.key === "alert:backing"));
+    s.delivered["alert:backing"] = {
+      fingerprint: "critical",
+      sentAt: start,
+    };
+    s.outbox = [];
+    observationUnavailable(s, quietConfig, start + 180_000);
+    assert.equal(s.active.backing.severity, "critical");
+    assert(!s.outbox.some((message) => message.fingerprint === "resolved"));
+    s.snapshot = snapshot();
+    s.snapshot.checkedAt = new Date(start + 181_000).toISOString();
+    s.snapshot.akashHeight++;
+    s.snapshot.solanaSlot++;
+    updateAlerts(
+      s,
+      evaluate(s.snapshot, quietConfig),
+      quietConfig,
+      start + 181_000,
+    );
+    assert(!s.active.backing);
+    assert(
+      s.outbox.some(
+        (message) =>
+          message.key === "alert:backing" && message.fingerprint === "resolved",
+      ),
+    );
+  }
+});
 test("escrow donation warns; a one-unit deficit is critical", () => {
   const s = snapshot();
   s.lockedUakt = "12000001";

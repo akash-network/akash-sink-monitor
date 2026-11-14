@@ -262,7 +262,9 @@ export async function run(
           log("snapshot", {
             akashHeight: snapshot.akashHeight,
             solanaSlot: snapshot.solanaSlot,
+            mintedUakt: snapshot.mintedUakt,
             supplyUakt: snapshot.supplyUakt,
+            burnedUakt: snapshot.burnedUakt,
             pendingUakt: snapshot.pendingUakt,
             alerts: Object.keys(state.active),
           });
