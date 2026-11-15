@@ -43,6 +43,8 @@ export function groupTransferAlerts(
     }
     let total = 0n;
     let known = 0;
+    let longestWaiting: Alert | undefined;
+    let earliestDeposit = Infinity;
     for (const alert of group) {
       const transfer = alert.transferId
         ? transfers.get(alert.transferId)
@@ -50,6 +52,10 @@ export function groupTransferAlerts(
       if (transfer) {
         total += BigInt(transfer.amountUakt);
         known++;
+        if (category === "pending" && transfer.depositedAt < earliestDeposit) {
+          longestWaiting = alert;
+          earliestDeposit = transfer.depositedAt;
+        }
       }
     }
     const examples = [...group]
@@ -63,15 +69,22 @@ export function groupTransferAlerts(
         return amountA === amountB ? 0 : amountA > amountB ? -1 : 1;
       })
       .slice(0, 3);
+    const longestWaitingDetail =
+      longestWaiting && !examples.includes(longestWaiting)
+        ? `\n\n*Longest waiting:*\n\n*${longestWaiting.transferId}*\n${longestWaiting.detail}`
+        : "";
     result.push({
       key: category + ":group",
       severity: first.severity,
       title: first.title,
       detail: `${group.length.toLocaleString("en-US")} affected transfers${known === group.length ? ` · ${formatAkt(total.toString())} AKT` : ""}.\n\n*${known === group.length ? "Largest affected transfers" : "Examples"}:*\n\n${examples
-        .map((alert) => `*${alert.transferId}*\n${alert.detail}`)
+        .map(
+          (alert) =>
+            `*${alert.transferId}*${alert === longestWaiting ? " · longest waiting" : ""}\n${alert.detail}`,
+        )
         .join(
           "\n\n",
-        )}\n\nAll affected transfers remain in the monitor's status and audit records.`,
+        )}${longestWaitingDetail}\n\nAll affected transfers remain in the monitor's status and audit records.`,
     });
   }
   return result;
