@@ -23,6 +23,7 @@ import {
   type Transfer,
 } from "./model";
 import { burnReceipts, enrichReceipts } from "./receipts";
+import { collectAccountCaps } from "./account-caps";
 
 export async function collectSnapshot(
   config: Config,
@@ -122,9 +123,6 @@ export async function collectSnapshot(
     config.staleSeconds,
   );
   try {
-    const owners = new Set(
-      result.records.map(({ record }) => sinkIdParts(record.id).owner),
-    );
     const caps: Cap[] = [
       {
         key: "akash-send",
@@ -154,20 +152,13 @@ export async function collectSnapshot(
         period: "Solana UTC mint day " + Math.floor(solanaTime / 86400),
       },
     ];
-    for (const owner of owners) {
-      const account = await akash.account(owner, state.height);
-      assert(
-        account.usage && account.epoch === state.epoch,
-        "account quota epoch mismatch",
-      );
-      caps.push({
-        key: "account:" + owner,
-        label: "Account " + owner,
-        usedUakt: coinAmount(account.usage.epochSent).toString(),
-        limitUakt: coinAmount(state.params.maxEpochAmountPerAccount).toString(),
-        period: "Native Akash day epoch " + state.epoch,
-      });
-    }
+    caps.push(
+      ...(await collectAccountCaps({
+        akash,
+        state,
+        records: result.records.map(({ record }) => record),
+      })),
+    );
     const blockTimes = new Map<string, number>();
     const previousById = new Map(
       previous?.transfers.map((row) => [row.id, row]),

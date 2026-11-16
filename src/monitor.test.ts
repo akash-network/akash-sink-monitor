@@ -6,6 +6,7 @@ import { web3 } from "@coral-xyz/anchor";
 import { base58 } from "@scure/base";
 import { TxBody, TxRaw, AuthInfo } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { TxMsgData } from "cosmjs-types/cosmos/base/abci/v1beta1/abci";
+import { Comet38Client } from "@cosmjs/tendermint-rpc";
 import {
   MsgSink,
   MsgSinkResponse,
@@ -36,7 +37,12 @@ import { rejectedDeposits } from "./transactions";
 import { metrics, serve } from "./http";
 import { once } from "node:events";
 import { observationUnavailable, withObservationWatchdog } from "./watchdog";
-import { depositReceipt, isResolutionReceipt, burnReceipts } from "./receipts";
+import {
+  depositReceipt,
+  isResolutionReceipt,
+  burnReceipts,
+  enrichReceipts,
+} from "./receipts";
 import { akashTxLink, solanaTxLink, transferLinks } from "./links";
 import { parseSinkId } from "../vendor/id";
 import { statusAddress } from "../vendor/proof";
@@ -139,6 +145,41 @@ const critical: Alert = {
   title: "Backing mismatch",
   detail: "1 uakt deficit",
 };
+
+test("quiet mode skips optional transaction-link RPCs while individual mode retains receipt lookup", async (t) => {
+  const block = t.mock.method(Comet38Client.prototype, "block", async () => {
+    throw new Error("Receipt history unavailable");
+  });
+  const results = t.mock.method(
+    Comet38Client.prototype,
+    "blockResults",
+    async () => {
+      throw new Error("Receipt history unavailable");
+    },
+  );
+  const sender = toBech32("akash", new Uint8Array(20).fill(1));
+  const rows = [{ ...transfer(), id: sender + "/100/1", owner: sender }];
+  const original = structuredClone(rows);
+  await enrichReceipts(
+    rows,
+    quietConfig,
+    "https://akash.example",
+    "https://solana.example",
+  );
+  assert.deepEqual(rows, original);
+  assert.equal(block.mock.callCount(), 0);
+  assert.equal(results.mock.callCount(), 0);
+  await enrichReceipts(
+    rows,
+    config,
+    "https://akash.example",
+    "https://solana.example",
+  );
+  assert.equal(block.mock.callCount(), 1);
+  assert.equal(results.mock.callCount(), 1);
+  assert(rows[0].receiptCheckedAt > 0);
+  assert.equal(rows[0].depositTxHash, null);
+});
 
 test("normal pending deposits do not create a false backing alarm", () => {
   const s = snapshot();

@@ -165,6 +165,7 @@ export async function enrichReceipts(
   akashRpc: string,
   solanaRpc: string,
 ) {
+  if (!config.transferNotifications) return;
   const deadline = Date.now() + 15_000;
   const signal = AbortSignal.timeout(15_000);
   const comet = Comet38Client.create(new HttpClient(akashRpc, 3000));
