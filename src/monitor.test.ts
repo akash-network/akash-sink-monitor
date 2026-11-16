@@ -176,15 +176,20 @@ test("both signs of a verified backing gap alert immediately and only coherent r
     observationUnavailable(s, quietConfig, start + 180_000);
     assert.equal(s.active.backing.severity, "critical");
     assert(!s.outbox.some((message) => message.fingerprint === "resolved"));
+    const outageAt = start + quietConfig.observationGraceSeconds * 1000;
+    observationUnavailable(s, quietConfig, outageAt);
+    assert.equal(s.active.backing.severity, "critical");
+    assert.equal(s.active["observation-unavailable"].severity, "critical");
+    assert(!s.outbox.some((message) => message.fingerprint === "resolved"));
     s.snapshot = snapshot();
-    s.snapshot.checkedAt = new Date(start + 181_000).toISOString();
+    s.snapshot.checkedAt = new Date(outageAt + 1000).toISOString();
     s.snapshot.akashHeight++;
     s.snapshot.solanaSlot++;
     updateAlerts(
       s,
       evaluate(s.snapshot, quietConfig),
       quietConfig,
-      start + 181_000,
+      outageAt + 1000,
     );
     assert(!s.active.backing);
     assert(
@@ -1196,19 +1201,155 @@ test("startup is quiet until its grace period ends and suppresses empty summarie
   assert(!s.outbox[0].text.includes("backing deficit"));
 });
 
-test("brief RPC interruptions stay quiet, while stale observations still alert", () => {
+test("observation grace delays only the existing outage alert and preserves its repeat interval", async () => {
   const s = state();
   s.snapshot = snapshot();
   const now = Date.parse(s.snapshot.checkedAt);
-  observationUnavailable(s, config, now + config.staleSeconds * 1000 - 1);
+  const deadline = now + config.observationGraceSeconds * 1000;
+  observationUnavailable(s, config, deadline - 1);
   assert.equal(s.outbox.length, 0);
-  const alert = observationUnavailable(
-    s,
-    config,
-    now + config.staleSeconds * 1000,
-  );
+  assert.match(summaryText(s, config, deadline - 1), /Updates unavailable/);
+  const alert = observationUnavailable(s, config, deadline);
   assert.equal(alert?.severity, "critical");
   assert.match(s.outbox[0].text, /Bridge updates have stopped/);
+  assert.match(s.outbox[0].text, /No new bridge data for 5m/);
+  await deliverOutbox({
+    state: s,
+    target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+    post: async () => new Response("ok"),
+    persist: async () => {},
+    now: () => deadline,
+  });
+  const repeatAt = deadline + config.alertRepeatSeconds * 1000;
+  observationUnavailable(s, config, repeatAt - 1);
+  assert.equal(s.outbox.length, 0);
+  observationUnavailable(s, config, repeatAt);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:observation-unavailable");
+});
+
+test("existing configurations gain grace without alerting before their freshness window", () => {
+  const { observationGraceSeconds, ...legacy } = config;
+  const upgraded = configSchema.parse(legacy);
+  assert.equal(upgraded.observationGraceSeconds, 300);
+  assert.equal(upgraded.staleSeconds, 120);
+  const s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  const longerFreshness = { ...upgraded, staleSeconds: 600 };
+  observationUnavailable(s, longerFreshness, start + 599_999);
+  assert.equal(s.outbox.length, 0);
+  observationUnavailable(s, longerFreshness, start + 600_000);
+  assert.equal(s.outbox[0].key, "alert:observation-unavailable");
+});
+
+test("repeated two-minute scans do not create outage or recovery-summary chatter", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  s.delivered.summary = { fingerprint: "summary", sentAt: start };
+  for (let cycle = 0; cycle < 40; cycle++) {
+    const last = start + cycle * 132_000;
+    observationUnavailable(s, config, last + 130_000);
+    assert.equal(s.outbox.length, 0);
+    const completed = last + 132_000;
+    s.snapshot.checkedAt = new Date(completed).toISOString();
+    updateAlerts(s, [], config, completed);
+    queueSummary(s, config, completed);
+    assert.equal(s.outbox.length, 0);
+  }
+});
+
+test("outage recoveries keep the two-hour summary schedule and accumulated activity across restarts", async () => {
+  let s = state();
+  const initial = snapshot();
+  const start = Date.parse(initial.checkedAt);
+  updateTransfers(s, initial, start, quietConfig);
+  s.snapshot = initial;
+  updateAlerts(s, [critical], quietConfig, start);
+  queueSummary(s, quietConfig, start);
+  const sent: string[] = [];
+  const deliver = async (at: number) =>
+    deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      post: async (_url, init) => {
+        sent.push(String(init?.body));
+        return new Response("ok");
+      },
+      persist: async () => {},
+      now: () => at,
+    });
+  await deliver(start);
+  for (let cycle = 1; cycle <= 3; cycle++) {
+    const recoveredAt = start + cycle * 1000_000;
+    observationUnavailable(s, quietConfig, recoveredAt - 1000);
+    await deliver(recoveredAt - 1000);
+    const next = {
+      ...initial,
+      checkedAt: new Date(recoveredAt).toISOString(),
+      transfers: Array.from({ length: cycle }, (_, i) => ({
+        ...transfer(),
+        id: `akash1sender/100/${i}`,
+      })),
+    };
+    updateTransfers(s, next, recoveredAt, quietConfig);
+    s.snapshot = next;
+    updateAlerts(s, [critical], quietConfig, recoveredAt);
+    queueSummary(s, quietConfig, recoveredAt);
+    assert(!s.outbox.some((message) => message.key === "summary"));
+    assert(
+      s.outbox.some(
+        (message) =>
+          message.key === "alert:observation-unavailable" &&
+          message.fingerprint === "resolved",
+      ),
+    );
+    await deliver(recoveredAt);
+    s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+    assert.equal(s.delivered.summary.sentAt, start);
+    assert.equal(s.transferTotals?.deposits, cycle);
+    assert.equal(s.active.backing.severity, "critical");
+  }
+  assert.equal(sent.filter((text) => text.includes("Akash Sink ·")).length, 1);
+  const due = start + quietConfig.summaryIntervalSeconds * 1000;
+  queueSummary(s, quietConfig, due - 1);
+  assert.equal(s.outbox.length, 0);
+  queueSummary(s, quietConfig, due);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "summary");
+  assert.match(s.outbox[0].text, /3 transfers · 3 AKT/);
+  await deliver(due);
+  assert.equal(s.transferTotals?.deposits, 0);
+  assert.equal(sent.filter((text) => text.includes("Akash Sink ·")).length, 2);
+});
+
+test("an early queued recovery summary is dropped without losing totals or delaying a critical alert", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  s.delivered.summary = { fingerprint: "summary", sentAt: start };
+  s.transferTotals = {
+    since: s.snapshot.checkedAt,
+    through: s.snapshot.checkedAt,
+    deposits: 2,
+    depositedUakt: "3000000",
+    mints: 0,
+    mintedUakt: "0",
+  };
+  queueMessage(s, {
+    key: "summary",
+    fingerprint: "summary",
+    text: "Earlier recovery summary",
+    now: start + 1000,
+    summaryTotals: { ...s.transferTotals },
+  });
+  updateAlerts(s, [critical], config, start + 1000);
+  queueSummary(s, config, start + 1000);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:backing");
+  assert.equal(s.transferTotals.deposits, 2);
+  assert.equal(s.transferTotals.depositedUakt, "3000000");
 });
 
 test("first connection coalesces recovery and baseline into one useful update", async () => {

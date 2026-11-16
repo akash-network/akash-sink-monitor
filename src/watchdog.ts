@@ -12,7 +12,7 @@ export function observationUnavailable(
     ? Date.parse(state.snapshot.checkedAt)
     : state.startedAt;
   const threshold = state.snapshot
-    ? config.staleSeconds
+    ? Math.max(config.staleSeconds, config.observationGraceSeconds)
     : config.startupGraceSeconds;
   if (now - lastSuccess < threshold * 1000) return;
   const alert: Alert = {

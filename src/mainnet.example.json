@@ -24,6 +24,7 @@
   "summaryIntervalSeconds": 7200,
   "transferNotifications": false,
   "staleSeconds": 120,
+  "observationGraceSeconds": 300,
   "startupGraceSeconds": 300,
   "listenHost": "127.0.0.1",
   "listenPort": 9465

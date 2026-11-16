@@ -163,15 +163,21 @@ export function queueSummary(state: MonitorState, config: Config, now: number) {
     );
     return;
   }
-  const recovery = state.outbox.some(
-    (message) =>
-      message.key === "alert:observation-unavailable" &&
-      message.fingerprint === "resolved",
-  );
+  state.outbox = state.outbox.filter((message) => message.key !== "baseline");
+  const delivered = state.delivered.summary;
+  if (
+    delivered &&
+    now - delivered.sentAt < config.summaryIntervalSeconds * 1000
+  ) {
+    state.outbox = state.outbox.filter((message) => message.key !== "summary");
+    return;
+  }
   state.outbox = state.outbox.filter(
     (message) =>
-      message.key !== "baseline" &&
-      !(recovery && message.key === "alert:observation-unavailable"),
+      !(
+        message.key === "alert:observation-unavailable" &&
+        message.fingerprint === "resolved"
+      ),
   );
   const pending = state.outbox.find((message) => message.key === "summary");
   if (pending) {
@@ -181,13 +187,6 @@ export function queueSummary(state: MonitorState, config: Config, now: number) {
       : undefined;
     return;
   }
-  const delivered = state.delivered.summary;
-  if (
-    !recovery &&
-    delivered &&
-    now - delivered.sentAt < config.summaryIntervalSeconds * 1000
-  )
-    return;
   queueMessage(state, {
     key: "summary",
     fingerprint: "summary",
