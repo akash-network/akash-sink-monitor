@@ -87,6 +87,49 @@ test("concurrent callers and later polls share endpoint pacing", async () => {
   assert(calls[4].at - calls[2].at >= 240);
 });
 
+test("Helius status scans retain freshness headroom with at most six requests per second", async () => {
+  for (const host of ["mainnet.helius-rpc.com", "beta.helius-rpc.com"]) {
+    const f = fixture(() => new Response("ok"));
+    const url = `https://${host}/?api-key=test-secret`;
+    for (let i = 0; i < 250; i++) await f.fetch(url, request);
+    assert.equal(f.calls.length, 250);
+    assert(
+      f.calls[249].at - f.calls[0].at < 45_000,
+      "status reads exceed the 45-second RPC pacing budget",
+    );
+    for (const call of f.calls)
+      assert(
+        f.calls.filter(
+          (other) => other.at >= call.at && other.at < call.at + 1000,
+        ).length <= 6,
+      );
+  }
+});
+
+test("other providers retain conservative pacing and Helius lookalike hosts do not match", async () => {
+  for (const host of ["rpc.example", "mainnet.helius-rpc.com.example"]) {
+    const f = fixture(() => new Response("ok"));
+    for (let i = 0; i < 6; i++) await f.fetch(`https://${host}/`, request);
+    assert(f.calls[5].at - f.calls[0].at >= 1250);
+  }
+});
+
+test("Helius pacing keeps Retry-After and the shared cooldown across later calls", async () => {
+  const f = fixture((attempt) =>
+    attempt === 1
+      ? new Response(null, { status: 429, headers: { "Retry-After": "5" } })
+      : new Response("ok"),
+  );
+  const url = "https://mainnet.helius-rpc.com/?api-key=test-secret";
+  await f.fetch(url, request);
+  await f.fetch(url, request);
+  assert.deepEqual(
+    f.calls.map((call) => call.at),
+    [0, 5000, 5167],
+  );
+  assert(!JSON.stringify(f.logs).includes("test-secret"));
+});
+
 test("persistent throttling stops after four attempts and preserves the cooldown", async () => {
   const f = fixture(() => new Response("throttled", { status: 429 }));
   const response = await f.fetch(endpoint, request);

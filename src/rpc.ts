@@ -58,6 +58,11 @@ export function createSolanaRpcFetch(
 
   return async (input, init = {}) => {
     const url = new URL(input instanceof Request ? input.url : input);
+    const spacingMs =
+      url.hostname === "mainnet.helius-rpc.com" ||
+      url.hostname === "beta.helius-rpc.com"
+        ? 167
+        : 250;
     const key = url.toString();
     const gate = endpoints.get(key) ?? {
       nextStart: 0,
@@ -82,7 +87,7 @@ export function createSolanaRpcFetch(
           signal.throwIfAborted();
           delay = Math.max(gate.nextStart, gate.cooldownUntil) - io.now();
         }
-        gate.nextStart = io.now() + 250;
+        gate.nextStart = io.now() + spacingMs;
       });
       gate.turn = turn.catch(() => {});
       await new Promise<void>((resolve, reject) => {
