@@ -24,6 +24,7 @@ import {
 } from "./model";
 import { burnReceipts, enrichReceipts } from "./receipts";
 import { collectAccountCaps } from "./account-caps";
+import { collectDepositTimes } from "./deposit-times";
 
 export async function collectSnapshot(
   config: Config,
@@ -159,10 +160,18 @@ export async function collectSnapshot(
         records: result.records.map(({ record }) => record),
       })),
     );
-    const blockTimes = new Map<string, number>();
     const previousById = new Map(
       previous?.transfers.map((row) => [row.id, row]),
     );
+    const blockTimes = await collectDepositTimes({
+      akash,
+      chainId: config.akashChainId,
+      stateDir: config.stateDir,
+      state,
+      heights: result.records
+        .filter(({ record }) => !previousById.has(record.id))
+        .map(({ record }) => record.height),
+    });
     const transfers: Transfer[] = [];
     let deposited = 0n,
       largestPending = 0n;
@@ -172,15 +181,9 @@ export async function collectSnapshot(
       assert.equal(outcome.id, record.id);
       assert(transfer.settlement?.policy, "missing transfer reporter policy");
       const old = previousById.get(record.id);
-      let depositedAt =
+      const depositedAt =
         old?.depositedAt ?? blockTimes.get(record.height.toString());
-      if (depositedAt === undefined) {
-        const block = await akash.comet.block(Number(record.height));
-        assert.equal(block.block.header.chainId, config.akashChainId);
-        assert.equal(block.block.header.height, Number(record.height));
-        depositedAt = Math.floor(block.block.header.time.getTime() / 1000);
-        blockTimes.set(record.height.toString(), depositedAt);
-      }
+      assert(depositedAt !== undefined, "missing deposit block time");
       deposited += record.amount;
       if (
         outcome.solana === "pending" &&
