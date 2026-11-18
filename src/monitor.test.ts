@@ -1242,7 +1242,7 @@ test("startup is quiet until its grace period ends and suppresses empty summarie
   assert(!s.outbox[0].text.includes("backing deficit"));
 });
 
-test("observation grace delays only the existing outage alert and preserves its repeat interval", async () => {
+test("observation grace keeps the first outage alert prompt and reminders two hours apart", async () => {
   const s = state();
   s.snapshot = snapshot();
   const now = Date.parse(s.snapshot.checkedAt);
@@ -1261,12 +1261,132 @@ test("observation grace delays only the existing outage alert and preserves its 
     persist: async () => {},
     now: () => deadline,
   });
-  const repeatAt = deadline + config.alertRepeatSeconds * 1000;
+  const repeatAt = deadline + 7200_000;
   observationUnavailable(s, config, repeatAt - 1);
   assert.equal(s.outbox.length, 0);
   observationUnavailable(s, config, repeatAt);
   assert.equal(s.outbox.length, 1);
   assert.equal(s.outbox[0].key, "alert:observation-unavailable");
+});
+
+test("repeated five-minute outages do not rearm pages across recoveries and restarts", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  const sent: string[] = [];
+  for (let cycle = 0; cycle < 20; cycle++) {
+    const failedAt = start + cycle * 360_000 + 300_000;
+    observationUnavailable(s, config, failedAt);
+    assert.equal(s.active["observation-unavailable"].severity, "critical");
+    assert.match(metrics(s, false, config), /akash_sink_monitor_fresh 0/);
+    await deliverOutbox({
+      state: s,
+      target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },
+      post: async (_url, init) => {
+        sent.push(String(init?.body));
+        return new Response("ok");
+      },
+      persist: async () => {},
+      now: () => failedAt,
+    });
+    const recoveredAt = failedAt + 60_000;
+    assert(s.snapshot);
+    s.snapshot.checkedAt = new Date(recoveredAt).toISOString();
+    updateAlerts(s, [], config, recoveredAt);
+    assert(!s.active["observation-unavailable"]);
+    assert.equal(s.outbox.length, 0);
+    s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  }
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Bridge updates have stopped/);
+  const due = start + 300_000 + 7200_000;
+  observationUnavailable(s, config, due);
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:observation-unavailable");
+});
+
+test("legacy outage notices retain cooldown and queued red or green duplicates are removed", () => {
+  for (const fingerprint of ["critical", "resolved"]) {
+    const s = state();
+    s.snapshot = snapshot();
+    const start = Date.parse(s.snapshot.checkedAt);
+    s.delivered["alert:observation-unavailable"] = {
+      fingerprint,
+      sentAt: start,
+    };
+    queueMessage(s, {
+      key: "alert:observation-unavailable",
+      fingerprint,
+      text: "Old queued outage notice",
+      now: start + 1,
+    });
+    observationUnavailable(s, config, start + 300_000);
+    assert.equal(s.outbox.length, 0);
+    assert.equal(s.active["observation-unavailable"].severity, "critical");
+    observationUnavailable(s, config, start + 7200_000);
+    assert.equal(s.outbox[0].fingerprint, "critical");
+  }
+});
+
+test("failed outage delivery retains its message and starts cooldown only after acceptance", async () => {
+  let s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  const failedAt = start + 300_000;
+  observationUnavailable(s, config, failedAt);
+  const id = s.outbox[0].id;
+  const target: SlackTarget = {
+    kind: "webhook",
+    url: "https://hooks.slack.com/services/TEST",
+  };
+  await assert.rejects(
+    deliverOutbox({
+      state: s,
+      target,
+      post: async () => new Response("unavailable", { status: 503 }),
+      persist: async () => {},
+      now: () => failedAt,
+    }),
+  );
+  assert(!s.delivered["alert:observation-unavailable"]);
+  s = monitorStateSchema.parse(JSON.parse(JSON.stringify(s)));
+  observationUnavailable(s, config, failedAt + 60_000);
+  assert.equal(s.outbox[0].id, id);
+  const deliveredAt = failedAt + 120_000;
+  await deliverOutbox({
+    state: s,
+    target,
+    post: async () => new Response("ok"),
+    persist: async () => {},
+    now: () => deliveredAt,
+  });
+  observationUnavailable(s, config, deliveredAt + 7200_000 - 1);
+  assert.equal(s.outbox.length, 0);
+  observationUnavailable(s, config, deliveredAt + 7200_000);
+  assert.equal(s.outbox.length, 1);
+});
+
+test("outage cooldown leaves financial alerts immediate and respects longer configured reminders", () => {
+  const s = state();
+  s.snapshot = snapshot();
+  const start = Date.parse(s.snapshot.checkedAt);
+  s.delivered["alert:observation-unavailable"] = {
+    fingerprint: "critical",
+    sentAt: start,
+  };
+  const longer = { ...config, alertRepeatSeconds: 14_400 };
+  observationUnavailable(s, longer, start + 7200_000);
+  assert.equal(s.outbox.length, 0);
+  updateAlerts(
+    s,
+    [...Object.values(s.active), critical],
+    longer,
+    start + 7200_000,
+  );
+  assert.equal(s.outbox.length, 1);
+  assert.equal(s.outbox[0].key, "alert:backing");
+  observationUnavailable(s, longer, start + 14_400_000);
+  assert(s.outbox.some((row) => row.key === "alert:observation-unavailable"));
 });
 
 test("existing configurations gain grace without alerting before their freshness window", () => {
@@ -1340,7 +1460,7 @@ test("outage recoveries keep the two-hour summary schedule and accumulated activ
     queueSummary(s, quietConfig, recoveredAt);
     assert(!s.outbox.some((message) => message.key === "summary"));
     assert(
-      s.outbox.some(
+      !s.outbox.some(
         (message) =>
           message.key === "alert:observation-unavailable" &&
           message.fingerprint === "resolved",

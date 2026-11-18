@@ -31,6 +31,7 @@ function evidence(alert: Alert, config: Config, state: MonitorState): string {
 }
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+const observationAlertKey = "alert:observation-unavailable";
 
 export function alertText(
   alert: Alert,
@@ -130,21 +131,24 @@ export function updateAlerts(
     state.snapshot,
   );
   state.outbox = state.outbox.filter(
-    (message) => !isIndividualTransferAlert(message.key),
+    (message) =>
+      !isIndividualTransferAlert(message.key) &&
+      !(
+        message.key === observationAlertKey &&
+        message.fingerprint === "resolved"
+      ),
   );
   for (const previous of previousNotifications) {
     const key = previous.key;
     if (active[key]) continue;
     state.outbox = state.outbox.filter((row) => row.key !== "alert:" + key);
+    if (key === "observation-unavailable") continue;
     if (state.delivered["alert:" + key]) {
       queueMessage(state, {
         key: "alert:" + key,
         fingerprint: "resolved",
         now,
-        text:
-          key === "observation-unavailable"
-            ? "*🟢 Bridge connection restored*\n\nFresh bridge data is available again."
-            : `*🟢 Resolved · ${slackEscape(previous.title)}*\n\nThe latest check is clear.${evidence(previous, config, state)}`,
+        text: `*🟢 Resolved · ${slackEscape(previous.title)}*\n\nThe latest check is clear.${evidence(previous, config, state)}`,
       });
     }
   }
@@ -158,6 +162,13 @@ export function updateAlerts(
     state.outbox = state.outbox.filter(
       (row) => row.key !== key || row.fingerprint !== "resolved",
     );
+    if (key === observationAlertKey) {
+      const repeatMs = Math.max(7200, config.alertRepeatSeconds) * 1000;
+      if (sent && now - sent.sentAt < repeatMs) {
+        state.outbox = state.outbox.filter((row) => row.key !== key);
+        continue;
+      }
+    }
     if (
       !previouslyActive.has(alert.key) ||
       !sent ||
