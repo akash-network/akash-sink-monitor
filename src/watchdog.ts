@@ -20,8 +20,8 @@ export function observationUnavailable(
     severity: "critical",
     title: state.snapshot
       ? "Bridge updates have stopped"
-      : "Sink monitor couldn’t connect",
-    detail: `${state.snapshot ? `No new bridge data for ${formatDuration((now - lastSuccess) / 1000)}.` : "The first bridge check hasn’t completed."}\nCheck the Akash and Solana RPC connections.`,
+      : "Sink monitor is still collecting data",
+    detail: `${state.snapshot ? `No completed bridge check for ${formatDuration((now - lastSuccess) / 1000)}.` : "The first bridge check hasn’t completed."}\nCurrent bridge health is unknown. Check the monitor logs for the failed collection step.`,
   };
   updateAlerts(
     state,

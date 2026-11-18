@@ -68,8 +68,8 @@ export function summaryText(
   if (!fresh) {
     sections.push(
       s
-        ? `No new bridge data for *${duration((now - Date.parse(s.checkedAt)) / 1000)}*.\nCheck the RPC connections. Balances below are from the last successful check.`
-        : "Waiting for the first bridge check.\nCheck the Akash and Solana RPC connections.",
+        ? `No completed bridge check for *${duration((now - Date.parse(s.checkedAt)) / 1000)}*.\nBalances below are from the last successful check.`
+        : "Waiting for the first complete bridge check.",
     );
   } else if (s) {
     const lag = BigInt(s.akashHeight) - BigInt(s.client.height);

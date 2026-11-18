@@ -1052,7 +1052,7 @@ test("summary reports unknown observations and escapes untrusted alert text", ()
   const s = state();
   s.active.example = { ...critical, title: "<@U123> & danger" };
   const text = summaryText(s, config, 0);
-  assert.match(text, /Waiting for the first bridge check/);
+  assert.match(text, /Waiting for the first complete bridge check/);
   assert.match(text, /\*Open issues\*/);
   assert.match(text, /&lt;@U123&gt; &amp; danger/);
   assert(!text.includes("Light client: active"));
@@ -1237,7 +1237,7 @@ test("startup is quiet until its grace period ends and suppresses empty summarie
   queueSummary(s, config, config.startupGraceSeconds * 1000);
   assert.equal(alert?.severity, "critical");
   assert.equal(s.outbox.length, 1);
-  assert.match(s.outbox[0].text, /couldn’t connect/);
+  assert.match(s.outbox[0].text, /still collecting data/);
   assert(!s.outbox[0].text.includes("Squad"));
   assert(!s.outbox[0].text.includes("backing deficit"));
 });
@@ -1253,7 +1253,7 @@ test("observation grace keeps the first outage alert prompt and reminders two ho
   const alert = observationUnavailable(s, config, deadline);
   assert.equal(alert?.severity, "critical");
   assert.match(s.outbox[0].text, /Bridge updates have stopped/);
-  assert.match(s.outbox[0].text, /No new bridge data for 5m/);
+  assert.match(s.outbox[0].text, /No completed bridge check for 5m/);
   await deliverOutbox({
     state: s,
     target: { kind: "webhook", url: "https://hooks.slack.com/services/TEST" },

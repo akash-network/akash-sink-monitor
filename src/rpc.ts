@@ -10,7 +10,7 @@ type Diagnostic = {
   event: "solana-rpc-retry" | "solana-rpc-failed";
   host: string;
   method: string;
-  status: number;
+  status: number | null;
   attempt: number;
   delayMs: number;
 };
@@ -105,15 +105,42 @@ export function createSolanaRpcFetch(
         );
       });
 
-      const response = await io.fetch(
-        input instanceof Request ? input.clone() : input,
-        { ...init, signal },
-      );
-      if (!retryable.has(response.status)) return response;
+      let response: Response | undefined;
+      try {
+        response = await io.fetch(
+          input instanceof Request ? input.clone() : input,
+          { ...init, signal },
+        );
+        if (!retryable.has(response.status)) {
+          if (!response.ok) return response;
+          const body =
+            response.body === null ? null : await response.arrayBuffer();
+          return new Response(body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        }
+      } catch (error) {
+        if (signal.aborted || !(error instanceof TypeError)) {
+          io.log({
+            event: "solana-rpc-failed",
+            host: url.hostname,
+            method: methodName(init.body),
+            status: null,
+            attempt,
+            delayMs: 0,
+          });
+          throw new Error(
+            `Solana RPC ${methodName(init.body)} failed on ${url.hostname}`,
+          );
+        }
+        response = undefined;
+      }
       const delayMs = Math.ceil(
         Math.max(
           1000 * 2 ** (attempt - 1) * (0.75 + io.random() * 0.5),
-          retryAfterMs(response.headers.get("retry-after"), io.now()),
+          retryAfterMs(response?.headers.get("retry-after") ?? null, io.now()),
         ),
       );
       gate.cooldownUntil = Math.max(gate.cooldownUntil, io.now() + delayMs);
@@ -121,12 +148,17 @@ export function createSolanaRpcFetch(
         event: attempt < 4 ? "solana-rpc-retry" : "solana-rpc-failed",
         host: url.host,
         method: methodName(init.body),
-        status: response.status,
+        status: response?.status ?? null,
         attempt,
         delayMs,
       });
-      if (attempt === 4) return response;
-      await response.body?.cancel();
+      if (attempt === 4) {
+        if (response) return response;
+        throw new Error(
+          `Solana RPC ${methodName(init.body)} failed on ${url.hostname}`,
+        );
+      }
+      await response?.body?.cancel();
     }
   };
 }

@@ -235,3 +235,69 @@ test("request bodies remain usable across retries", async () => {
   assert.equal((await fetch(new Request(endpoint, request))).status, 200);
   assert.deepEqual(bodies, [request.body, request.body]);
 });
+
+test("Solana connection and interrupted-body failures retry the identical read", async () => {
+  for (const kind of ["connect", "body"]) {
+    let now = 0;
+    const calls: RequestInit["body"][] = [];
+    const logs: object[] = [];
+    const fetch = createSolanaRpcFetch({
+      fetch: async (_input, init) => {
+        calls.push(init?.body);
+        if (calls.length === 1) {
+          if (kind === "connect")
+            throw new TypeError("private transport details");
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new TypeError("terminated private details"));
+              },
+            }),
+          );
+        }
+        return new Response("complete response");
+      },
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      random: () => 0.5,
+      log: (entry) => {
+        logs.push(entry);
+      },
+    });
+    assert.equal(
+      await (await fetch(endpoint, request)).text(),
+      "complete response",
+    );
+    assert.deepEqual(calls, [request.body, request.body]);
+    assert.equal(now, 1000);
+    assert(!/private|test-secret/.test(JSON.stringify(logs)));
+    assert.match(JSON.stringify(logs), /solana-rpc-retry/);
+  }
+});
+
+test("persistent Solana transport errors stop after four attempts with safe attribution", async () => {
+  let count = 0;
+  let now = 0;
+  const logs: object[] = [];
+  const fetch = createSolanaRpcFetch({
+    fetch: async () => {
+      count++;
+      throw new TypeError("https://rpc.example/?api-key=private");
+    },
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    log: (entry) => {
+      logs.push(entry);
+    },
+  });
+  await assert.rejects(
+    fetch(endpoint, request),
+    /Solana RPC getGenesisHash failed on rpc.example/,
+  );
+  assert.equal(count, 4);
+  assert(!JSON.stringify(logs).includes("private"));
+});

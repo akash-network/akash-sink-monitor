@@ -107,7 +107,12 @@ async function fixture(t: TestContext, recordCount = 2) {
     truncateOriginalPage: false,
     burnRootSlot: 1002,
     burnSlot: 0,
+    omitBulk: false,
+    duplicateBulk: false,
+    unavailableBulk: false,
+    badClockReads: 0,
   };
+  const requests: { method: string; count: number }[] = [];
   const accounts = new Map<string, web3.AccountInfo<Buffer>>();
   let stateReads = 0;
   t.mock.method(AkashClient.prototype, "state", async () =>
@@ -144,11 +149,51 @@ async function fixture(t: TestContext, recordCount = 2) {
   });
   const connection = new web3.Connection("https://solana.example", {
     commitment: "finalized",
-    fetch: async (_url, init) => {
+    fetch: async (_url, init): Promise<Response> => {
       assert(init && typeof init.body === "string");
       const request = requestSchema.parse(JSON.parse(String(init.body)));
+      requests.push({
+        method: request.method,
+        count: Array.isArray(request.params[0]) ? request.params[0].length : 0,
+      });
       let result: unknown;
       switch (request.method) {
+        case "getProgramAccounts": {
+          assert.equal(request.params[0], programId.toBase58());
+          const options = z
+            .object({
+              commitment: z.literal("finalized"),
+              withContext: z.literal(true),
+              minContextSlot: z.number(),
+              filters: z.array(
+                z.object({
+                  memcmp: z.object({
+                    offset: z.literal(0),
+                    bytes: z.string(),
+                  }),
+                }),
+              ),
+            })
+            .parse(request.params[1]);
+          assert.equal(options.minContextSlot, current.supplySlot);
+          assert.deepEqual(options.filters, [
+            { memcmp: program.coder.accounts.memcmp("transferStatus") },
+          ]);
+          if (current.unavailableBulk) throw new Error("bulk RPC unavailable");
+          const value = [...accounts].map(([pubkey, account]) => ({
+            pubkey,
+            account: {
+              ...account,
+              owner: account.owner.toBase58(),
+              rentEpoch: 0,
+              data: [account.data.toString("base64"), "base64"],
+            },
+          }));
+          if (current.omitBulk || current.truncateOriginalPage) value.pop();
+          if (current.duplicateBulk) value.push(value[0]);
+          result = { context: { slot: current.laterSlot }, value };
+          break;
+        }
         case "getMultipleAccounts": {
           const addresses = z.array(z.string()).parse(request.params[0]);
           const options = z
@@ -174,7 +219,13 @@ async function fixture(t: TestContext, recordCount = 2) {
             data,
           );
           const clock = Buffer.alloc(40);
-          clock.writeBigUInt64LE(BigInt(current.clockSlot));
+          clock.writeBigUInt64LE(
+            BigInt(
+              current.badClockReads-- > 0
+                ? current.clockSlot + 1
+                : current.clockSlot,
+            ),
+          );
           const page = {
             context: {
               slot: isSupplyPage ? current.supplySlot : current.laterSlot,
@@ -330,6 +381,7 @@ async function fixture(t: TestContext, recordCount = 2) {
         statusAddress(programId, decodeRecord(entry).id).toBase58(),
       ),
     directory,
+    requests,
     reconcile: () => {
       stateReads = 0;
       return reconcileConfigured({
@@ -605,7 +657,7 @@ test("a mint after a coherent supply slot is excluded without an alarm", async (
 
 for (const gap of [-1_000_000n, -1n, 1n, 1_000_000n]) {
   test(`a coherent ${gap} uakt discrepancy still reaches the backing alarm immediately`, async (t) => {
-    const f = await fixture(t);
+    const f = await fixture(t, 105);
     f.current.supply -= gap;
     const { report } = await f.reconcile();
     assert.equal(report.status, "mismatch");
@@ -657,4 +709,124 @@ test("a concurrent burn belongs to its supply slot and is not counted again afte
   result = await f.reconcile();
   assert.equal(result.report.status, "healthy");
   assert.equal(result.report.cumulativeBurnedUakt, "1000000");
+});
+
+test("25,000 finalized transfers do not require hundreds of status requests", async (t) => {
+  const f = await fixture(t, 25_000);
+  f.current.history = [...f.original];
+  const started = performance.now();
+  const { report, outcomes } = await f.reconcile();
+  assert.equal(report.status, "healthy");
+  assert.equal(outcomes.length, 25_000);
+  assert.equal(report.observedMintedUakt, "25000000000");
+  assert.equal(
+    f.requests.filter((r) =>
+      ["getProgramAccounts", "getMultipleAccounts"].includes(r.method),
+    ).length,
+    2,
+    "status collection exceeds the two-request budget",
+  );
+  assert.equal(
+    f.requests.filter((r) => r.method === "getProgramAccounts").length,
+    1,
+  );
+  assert.equal(
+    f.requests.filter((r) => r.method === "getMultipleAccounts").length,
+    1,
+  );
+  t.diagnostic(
+    JSON.stringify({
+      transfers: outcomes.length,
+      elapsedMs: performance.now() - started,
+      maxRssKiB: process.resourceUsage().maxRSS,
+    }),
+  );
+  for (const row of f.original.slice(-1000)) f.clearStatus(row);
+  f.current.supply -= 1_000_000_000n;
+  f.requests.length = 0;
+  const pending = await f.reconcile();
+  assert.equal(pending.report.status, "healthy");
+  assert.equal(pending.report.pendingUnmintedUakt, "1000000000");
+  assert.equal(
+    f.requests.filter((r) => r.method === "getMultipleAccounts").length,
+    11,
+  );
+});
+
+for (const unavailable of [false, true]) {
+  test(`bulk ${unavailable ? "failure" : "omission"} is repaired by explicit status reads`, async (t) => {
+    const f = await fixture(t, 105);
+    f.current.omitBulk = true;
+    f.current.unavailableBulk = unavailable;
+    const { report } = await f.reconcile();
+    assert.equal(report.status, "healthy");
+    assert.equal(report.observedMintedUakt, "105000000");
+    assert(
+      f.requests.some(
+        (r) =>
+          r.method === "getMultipleAccounts" &&
+          r.count === (unavailable ? 7 : 1),
+      ),
+    );
+  });
+}
+
+test("a bulk omission plus explicit absence still exposes a real backing gap", async (t) => {
+  const f = await fixture(t, 105);
+  const last = f.original.at(-1);
+  assert(last);
+  f.clearStatus(last);
+  const { report } = await f.reconcile();
+  assert(
+    report.alerts.includes("backing minus supply and burns: -1000000 uakt"),
+  );
+});
+
+test("bulk responses with regressed contexts or duplicate accounts fail closed", async (t) => {
+  const f = await fixture(t, 105);
+  f.current.laterSlot = 999;
+  await assert.rejects(f.reconcile(), /status context regressed/);
+  f.current.laterSlot = 1000;
+  f.current.duplicateBulk = true;
+  await assert.rejects(f.reconcile(), /duplicate Solana status account/);
+  await assert.rejects(readFile(join(f.directory, "reconciliation.json")), {
+    code: "ENOENT",
+  });
+});
+
+test("bulk accounts retain owner, identity, proof and amount validation", async (t) => {
+  const f = await fixture(t, 105);
+  const last = f.original.at(-1);
+  assert(last);
+  let account = await f.resolve(last, 990);
+  account.owner = web3.PublicKey.default;
+  await assert.rejects(f.reconcile(), /invalid Solana status owner/);
+  account = await f.resolve(last, 990);
+  account.data = Buffer.alloc(account.data.length);
+  await assert.rejects(f.reconcile(), /Invalid account discriminator/);
+  for (const kind of ["identity", "proof", "amount"]) {
+    await f.resolve(last, 990, (status) => {
+      if (kind === "identity") status.id.sequence = new BN(999999);
+      if (kind === "proof") status.proofHeight = new BN(1);
+      if (kind === "amount") {
+        assert(status.outcome.minted);
+        status.outcome.minted.amount = new BN(1);
+      }
+    });
+    await assert.rejects(f.reconcile());
+  }
+});
+
+test("a transient supply/Clock mismatch recollects the whole supply page before proceeding", async (t) => {
+  const f = await fixture(t);
+  f.current.badClockReads = 1;
+  const { report } = await f.reconcile();
+  assert.equal(report.status, "healthy");
+  assert.equal(
+    f.requests.filter(
+      (r) => r.method === "getMultipleAccounts" && r.count === 4,
+    ).length,
+    2,
+  );
+  assert.equal(report.solanaSlot, 1000);
 });

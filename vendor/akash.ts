@@ -1,6 +1,7 @@
 // Adapted from akash-network/node 4373aa92; see vendor/README.md and NODE-LICENSE.
 import assert from "node:assert/strict";
-import { Comet38Client, HttpClient } from "@cosmjs/tendermint-rpc";
+import { Comet38Client } from "@cosmjs/tendermint-rpc";
+import { AkashRpcClient } from "./akash-rpc";
 import { QueryClient } from "@cosmjs/stargate";
 import {
   QueryTransfersRequest,
@@ -30,7 +31,7 @@ export class AkashClient {
     private readonly chainId: string,
     private readonly maxAgeSeconds: number,
   ) {
-    this.comet = Comet38Client.create(new HttpClient(url, 15_000));
+    this.comet = Comet38Client.create(new AkashRpcClient(url, 15_000));
     this.query = new QueryClient(this.comet);
   }
   close() {

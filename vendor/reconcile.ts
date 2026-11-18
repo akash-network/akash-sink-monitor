@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { toBech32 } from "@cosmjs/encoding";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { setTimeout } from "node:timers/promises";
 import idl from "../idl/akt.json";
 import type { Akt } from "../idl/akt";
 import { AkashClient } from "./akash";
@@ -20,6 +21,7 @@ import { object, pda } from "./common";
 import { atomicJson, optionalJson } from "./durable";
 import { collectPages } from "./open-transfers";
 import { inSnapshot, transferAlerts } from "./reconcile-policy";
+import { statusAccounts } from "./status-accounts";
 
 function amount(value: unknown) {
   assert.ok(
@@ -206,6 +208,57 @@ async function indexBurns(
   return next;
 }
 
+async function supplySnapshot(input: {
+  connection: web3.Connection;
+  addresses: web3.PublicKey[];
+  minContextSlot: number;
+}) {
+  const { connection, addresses, minContextSlot } = input;
+  for (let attempt = 1; ; attempt++) {
+    const snapshot = await connection.getMultipleAccountsInfoAndContext(
+      addresses,
+      { commitment: "finalized", minContextSlot },
+    );
+    assert.ok(snapshot.context.slot >= minContextSlot);
+    assert.equal(
+      snapshot.value.length,
+      addresses.length,
+      "incomplete Solana account page",
+    );
+    const clock = snapshot.value[1];
+    assert.ok(
+      clock &&
+        !clock.executable &&
+        clock.owner.toBase58() ===
+          "Sysvar1111111111111111111111111111111111111" &&
+        clock.data.length === 40,
+      "Solana Clock unavailable in supply snapshot",
+    );
+    if (
+      clock.data.readBigUInt64LE(0) !== BigInt(snapshot.context.slot) &&
+      attempt < 3
+    ) {
+      process.stdout.write(
+        JSON.stringify({
+          time: new Date().toISOString(),
+          event: "solana-supply-context-retry",
+          attempt,
+          slot: snapshot.context.slot,
+          clockSlot: clock.data.readBigUInt64LE(0).toString(),
+        }) + "\n",
+      );
+      await setTimeout(250);
+      continue;
+    }
+    assert.equal(
+      clock.data.readBigUInt64LE(0),
+      BigInt(snapshot.context.slot),
+      "Solana supply snapshot context disagrees with Clock; retry snapshot",
+    );
+    return snapshot;
+  }
+}
+
 // Supply only public identities and a read-only connection.
 export async function reconcileConfigured(input: {
   connection: web3.Connection;
@@ -221,6 +274,19 @@ export async function reconcileConfigured(input: {
     { connection },
   );
   const akash = new AkashClient(input.akashRpc, input.chainId, 60);
+  let stageStarted = Date.now();
+  const completedStage = (stage: string) => {
+    const now = Date.now();
+    process.stdout.write(
+      JSON.stringify({
+        time: new Date(now).toISOString(),
+        event: "reconciliation-stage",
+        stage,
+        elapsedMs: now - stageStarted,
+      }) + "\n",
+    );
+    stageStarted = now;
+  };
   try {
     const state = await akash.state();
     const records = (
@@ -228,6 +294,7 @@ export async function reconcileConfigured(input: {
         akash.transfers(state.height, { key, limit: 500 }),
       )
     ).map(({ transfer }) => ({ transfer, record: decodeRecord(transfer) }));
+    completedStage("akash-history");
     const mint = pda("mint", programId);
     const addresses = [
       mint,
@@ -243,46 +310,21 @@ export async function reconcileConfigured(input: {
       }, 0n),
     );
     const firstPage = addresses.slice(0, 100);
-    const snapshot = await connection.getMultipleAccountsInfoAndContext(
-      firstPage,
-      { commitment: "finalized", minContextSlot },
-    );
-    assert.ok(snapshot.context.slot >= minContextSlot);
-    assert.equal(
-      snapshot.value.length,
-      firstPage.length,
-      "incomplete Solana account page",
-    );
-    const clock = snapshot.value[1];
-    assert.ok(
-      clock &&
-        !clock.executable &&
-        clock.owner.toBase58() ===
-          "Sysvar1111111111111111111111111111111111111" &&
-        clock.data.length === 40,
-      "Solana Clock unavailable in supply snapshot",
-    );
-    // An RPC can return account data newer than its advertised context.
-    assert.equal(
-      clock.data.readBigUInt64LE(0),
-      BigInt(snapshot.context.slot),
-      "Solana supply snapshot context disagrees with Clock; retry snapshot",
-    );
-    const infos = [...snapshot.value];
-    for (let i = 100; i < addresses.length; i += 100) {
-      const batch = addresses.slice(i, i + 100);
-      const page = await connection.getMultipleAccountsInfoAndContext(batch, {
-        commitment: "finalized",
-        minContextSlot: snapshot.context.slot,
-      });
-      assert.ok(page.context.slot >= snapshot.context.slot);
-      assert.equal(
-        page.value.length,
-        batch.length,
-        "incomplete Solana account page",
-      );
-      infos.push(...page.value);
-    }
+    const snapshot = await supplySnapshot({
+      connection,
+      addresses: firstPage,
+      minContextSlot,
+    });
+    const infos = [
+      ...snapshot.value,
+      ...(await statusAccounts({
+        connection,
+        program,
+        addresses: addresses.slice(100),
+        slot: snapshot.context.slot,
+      })),
+    ];
+    completedStage("solana-statuses");
     // Later deposits can be left to the next poll unless they already minted
     // at the pinned supply slot. Only that case invalidates this backing set.
     const freshState = await akash.state();
@@ -330,6 +372,7 @@ export async function reconcileConfigured(input: {
           "new deposit already minted at snapshot slot; retry snapshot",
         );
     }
+    completedStage("arrival-check");
     const mintInfo = unpackMint(mint, infos[0], TOKEN_PROGRAM_ID);
     assert.equal(mintInfo.decimals, 6);
     assert.equal(mintInfo.freezeAuthority, null);
@@ -415,6 +458,7 @@ export async function reconcileConfigured(input: {
       coinAmount(state.totals.refundPendingAmount);
     if (balance !== accounted)
       alerts.push("Akash bank escrow differs from sink totals");
+    completedStage("accounting");
     const burnIndex = await indexBurns(
       connection,
       mint,
@@ -422,6 +466,7 @@ export async function reconcileConfigured(input: {
       stateDir,
       programId,
     );
+    completedStage("burn-history");
     // Every SPL AKT was minted for a proven record whose escrow stays locked
     // on Akash: supply plus burns equals the escrow behind Minted records.
     const backing = observedMinted;

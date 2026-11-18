@@ -36,6 +36,7 @@ export async function poll(config: Config, state: MonitorState) {
   // combine pages from different RPCs into a supposedly coherent observation.
   for (let a = 0; a < config.akashRpcs.length; a++) {
     for (let s = 0; s < config.solanaRpcs.length; s++) {
+      const started = Date.now();
       try {
         const connection = new web3.Connection(config.solanaRpcs[s], {
           commitment: "finalized",
@@ -54,11 +55,20 @@ export async function poll(config: Config, state: MonitorState) {
             snapshot.solanaSlot < state.snapshot.solanaSlot)
         )
           throw new Error("RPC snapshot regressed");
+        log("snapshot-collected", {
+          elapsedMs: Date.now() - started,
+          transfers: snapshot.transfers.length,
+          akashAgeSeconds: Math.floor(Date.now() / 1000 - snapshot.akashTime),
+          solanaAgeSeconds: Math.floor(Date.now() / 1000 - snapshot.solanaTime),
+          akashEndpoint: a,
+          solanaEndpoint: s,
+        });
         return { snapshot, akashRpc: config.akashRpcs[a] };
       } catch (error) {
         // RPC URLs can contain API credentials. Do not serialize raw SDK
         // exceptions or HTTP response bodies into Slack or durable state.
         log("snapshot-attempt-failed", {
+          elapsedMs: Date.now() - started,
           akashEndpoint: a,
           solanaEndpoint: s,
           errorType: error instanceof Error ? error.name : "unknown",
